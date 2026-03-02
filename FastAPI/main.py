@@ -216,7 +216,7 @@ def _attempt_inpaint_with_lama(original_bgr: np.ndarray, mask_uint8: np.ndarray)
         return original_bgr
 
 
-@app.post("/process_roi", summary="Process full image using ROI for OCR -> build full-image mask -> inpaint full image")
+@app.post("/process_roi", summary="Inpaint user-cropped ROI on full image using LaMa")
 async def process_with_roi(
     file: UploadFile = File(...),
     polygon: str = Form(...),
@@ -226,10 +226,11 @@ async def process_with_roi(
     """
     Expects:
     - file: full original image (multipart)
-    - polygon: JSON array of 4 points [{x:...,y:...}, ...] in image natural pixel coordinates (clockwise or any order)
-    - padding: optional pixels to expand mask (0 = use OCR boxes as-is, no padding)
-    - min_confidence: minimum OCR confidence to include
-    Returns JSON with base64 fields: final (full-size inpainted PNG), mask (full-size PNG), annotated (optional)
+    - polygon: JSON array of 4 points [{x,y}, ...] in image coordinates (the user-cropped ROI)
+    - padding: optional pixels to expand the ROI mask before inpainting (0 = use ROI as-is)
+    - min_confidence: minimum OCR confidence (used only for optional annotated/text_regions)
+    The mask passed to LaMa is the user-cropped ROI (polygon), not OCR-detected boxes.
+    Returns JSON with base64 fields: final (inpainted PNG), mask (ROI mask PNG), annotated (optional)
     """
     if file.content_type.split("/")[0] != "image":
         raise HTTPException(status_code=400, detail="Uploaded file must be an image")
@@ -262,87 +263,48 @@ async def process_with_roi(
     Minv = cv2.getPerspectiveTransform(dst, src)
 
     crop = cv2.warpPerspective(img_bgr, M, (rect_w, rect_h), flags=cv2.INTER_LINEAR)
-
-    # OCR on the rectified crop (convert to RGB)
     crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-    try:
-        ocr_results = ocr_model.ocr(crop_rgb, cls=True)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"OCR failed: {e}")
 
-    # prepare full-size mask
+    # Full-image mask = user-cropped ROI (polygon), not OCR boxes. LaMa gets this mask.
     mask_full = np.zeros((h_orig, w_orig), dtype=np.uint8)
-    print(f"OCR detected: ",ocr_results)
-    # PaddleOCR returns results as [[line1, line2, ...]] — one outer list per image page.
-    # Flatten so we iterate over individual line results, each being [box, (text, score)].
-    score_thresh = float(min_confidence) / 100.0
-    valid_boxes = []
-    flat_results = []
-    for page in (ocr_results or []):
-        if page is None:
-            continue
-        # A page is a list of line results; extend to flatten one level.
-        if isinstance(page, list) and page and isinstance(page[0], list):
-            flat_results.extend(page)
-        else:
-            # Already a single line result (unlikely but safe fallback)
-            flat_results.append(page)
-    for res in flat_results:
-        try:
-            box = res[0]  # list of 4 points [[x,y],...]
-            rec = res[1]
-            if isinstance(rec, (list, tuple)) and len(rec) >= 2:
-                text = str(rec[0]).strip()
-                score = float(rec[1])
-            else:
-                text = str(rec).strip()
-                score = 1.0
-        except Exception:
-            continue
-        if not text or score < score_thresh:
-            continue
-        valid_boxes.append((box, text, score))
-
-        # Create a mask for this box in crop (rectified) coordinates (OCR box as-is, no padding).
-        # Optionally dilate if padding > 0.
-        try:
-            crop_mask = np.zeros((rect_h, rect_w), dtype=np.uint8)
-            pts = np.array(box, dtype=np.int32).reshape((-1, 1, 2))
-            cv2.fillPoly(crop_mask, [pts], 255)
-            if padding > 0:
-                k = max(1, int(padding))
-                kernel = np.ones((k, k), np.uint8)
-                crop_mask = cv2.dilate(crop_mask, kernel, iterations=1)
-            # warp this crop mask back to full image using inverse perspective (Minv)
-            warped = cv2.warpPerspective(crop_mask, Minv, (w_orig, h_orig), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-            mask_full = cv2.bitwise_or(mask_full, warped)
-        except Exception:
-            # fallback to mapping polygon points directly if anything fails
-            try:
-                box_arr = np.array(box, dtype=np.float32).reshape(1, -1, 2)
-                mapped = cv2.perspectiveTransform(box_arr, Minv).reshape(-1, 2).astype(np.int32)
-                cv2.fillPoly(mask_full, [mapped], color=255)
-            except Exception:
-                # final fallback: axis-aligned rect mapping
-                xs = [int(p[0]) for p in box]
-                ys = [int(p[1]) for p in box]
-                lx = max(0, min(xs) - padding)
-                ty = max(0, min(ys) - padding)
-                rx = min(rect_w - 1, max(xs) + padding)
-                by = min(rect_h - 1, max(ys) + padding)
-                box_corners = np.array([[[lx, ty]], [[rx, ty]], [[rx, by]], [[lx, by]]], dtype=np.float32)
-                mapped = cv2.perspectiveTransform(box_corners, Minv).reshape(-1, 2).astype(np.int32)
-                cv2.fillPoly(mask_full, [mapped], color=255)
-
-    # Morphological cleanup to ensure a strict binary mask:
-    # - dilate then erode (close) to fill small gaps without producing anti-aliased values
+    roi_pts = np.array(ordered, dtype=np.int32).reshape((-1, 1, 2))
+    cv2.fillPoly(mask_full, [roi_pts], 255)
     if padding > 0:
-        k = max(1, int(padding / 2))
+        k = max(1, int(padding))
         kernel = np.ones((k, k), np.uint8)
         mask_full = cv2.dilate(mask_full, kernel, iterations=1)
-        mask_full = cv2.erode(mask_full, kernel, iterations=1)
-    # Ensure strictly binary 0 or 255
     mask_full = ((mask_full > 0).astype(np.uint8)) * 255
+
+    # OCR only for optional annotated image and text_regions in the response (not for the mask)
+    valid_boxes = []
+    try:
+        ocr_results = ocr_model.ocr(crop_rgb, cls=True)
+        score_thresh = float(min_confidence) / 100.0
+        flat_results = []
+        for page in (ocr_results or []):
+            if page is None:
+                continue
+            if isinstance(page, list) and page and isinstance(page[0], list):
+                flat_results.extend(page)
+            else:
+                flat_results.append(page)
+        for res in flat_results:
+            try:
+                box = res[0]
+                rec = res[1]
+                if isinstance(rec, (list, tuple)) and len(rec) >= 2:
+                    text = str(rec[0]).strip()
+                    score = float(rec[1])
+                else:
+                    text = str(rec).strip()
+                    score = 1.0
+            except Exception:
+                continue
+            if not text or score < score_thresh:
+                continue
+            valid_boxes.append((box, text, score))
+    except Exception as e:
+        pass  # OCR optional; mask is already the ROI
 
     # Run object removal via LaMa: pass full image + full mask to predict.inpaint()
     inpainted_bgr = None

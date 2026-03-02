@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import shutil
 import io
-import subprocess
+import sys
 import zipfile
 import base64
 import importlib.util
@@ -173,45 +173,20 @@ def _np_to_b64_png(img_np: np.ndarray) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def _run_predict_script(indir: Path, outdir: Path, image_stem: str = "input") -> Optional[Path]:
-    """
-    Run bin/predict.py with the given indir (containing image.png and image_mask.png)
-    and outdir. Returns path to the output inpainted image, or None on failure.
-    """
+def _get_lama_inpaint():
+    """Import and return the inpaint function from bin.predict, or None if unavailable."""
     base = Path(__file__).resolve().parents[1]
-    predict_script = base / "bin" / "predict.py"
-    model_path = base / "pretrained_models" / "big-lama"
-    if not predict_script.exists():
-        return None
-    if not model_path.exists():
-        return None
-    indir_str = str(indir.resolve()).replace("\\", "/")
-    outdir_str = str(outdir.resolve()).replace("\\", "/")
-    if not indir_str.endswith("/"):
-        indir_str += "/"
-    cmd = [
-        "python",
-        str(predict_script),
-        f"indir={indir_str}",
-        f"outdir={outdir_str}",
-        f"model.path={model_path}",
-    ]
+    base_str = str(base)
+    if base_str not in sys.path:
+        sys.path.insert(0, base_str)
     try:
-        result = subprocess.run(
-            cmd,
-            cwd=str(base),
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        if result.returncode != 0:
-            return None
-        # predict.py writes output as outdir/<mask_basename>.png (e.g. input_mask.png)
-        out_path = outdir / f"{image_stem}_mask.png"
-        if out_path.exists():
-            return out_path
-        return None
-    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+        from bin.predict import inpaint
+        print("=>> Successfully imported bin.predict.inpaint for LaMa inpainting", flush=True)
+        return inpaint
+    except Exception as e:
+        print(f"[LaMa] Could not import bin.predict.inpaint: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -228,8 +203,8 @@ def _attempt_inpaint_with_lama(original_bgr: np.ndarray, mask_uint8: np.ndarray)
         if hasattr(tr, "run_lama_inpaint"):
             # Expected signature: run_lama_inpaint(np_image_bgr, mask_uint8) -> np_image_bgr
             return tr.run_lama_inpaint(original_bgr, mask_uint8)
-    except Exception:
-        print("LaMa inpainting not available or failed, falling back to OpenCV")
+    except Exception as e:
+        print("LaMa (text_removal.run_lama_inpaint) not available or failed, falling back to OpenCV inpainting:", e, flush=True)
         pass
 
     # Fallback: OpenCV inpaint (Telea)
@@ -259,12 +234,14 @@ async def process_with_roi(
     if file.content_type.split("/")[0] != "image":
         raise HTTPException(status_code=400, detail="Uploaded file must be an image")
 
-    # read file into numpy BGR
+    # Decode image with PIL so pixels match bin/predict.py CLI (load_image uses PIL)
     data = await file.read()
-    arr = np.frombuffer(data, np.uint8)
-    img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img_bgr is None:
-        raise HTTPException(status_code=400, detail="Failed to decode image")
+    try:
+        pil_img = Image.open(io.BytesIO(data)).convert("RGB")
+        img_rgb = np.array(pil_img)
+        img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to decode image: {e}")
     h_orig, w_orig = img_bgr.shape[:2]
 
     # parse polygon
@@ -367,24 +344,25 @@ async def process_with_roi(
     # Ensure strictly binary 0 or 255
     mask_full = ((mask_full > 0).astype(np.uint8)) * 255
 
-    # Run object removal via predict.py: pass full image + full mask to LaMa
+    # Run object removal via LaMa: pass full image + full mask to predict.inpaint()
     inpainted_bgr = None
-    with tempfile.TemporaryDirectory() as lama_tmp:
-        lama_indir = Path(lama_tmp) / "in"
-        lama_outdir = Path(lama_tmp) / "out"
-        lama_indir.mkdir(parents=True, exist_ok=True)
-        lama_outdir.mkdir(parents=True, exist_ok=True)
-        image_stem = "input"
-        image_path = lama_indir / f"{image_stem}.png"
-        mask_path = lama_indir / f"{image_stem}_mask.png"
-        # predict.py dataset expects image + image_mask.png (same dir); load_image uses RGB
-        Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)).save(image_path, format="PNG")
-        Image.fromarray(mask_full).save(mask_path, format="PNG")
-        out_path = _run_predict_script(lama_indir, lama_outdir, image_stem=image_stem)
-        if out_path is not None and out_path.exists():
-            inpainted_bgr = cv2.imread(str(out_path))
+    inpainting_method = "opencv"  # will be set to "lama" if LaMa succeeds
+    lama_inpaint = _get_lama_inpaint()
+    base = Path(__file__).resolve().parents[1]
+    model_path = base / "pretrained_models" / "big-lama"
+    if lama_inpaint is not None:
+        if model_path.exists():
+            inpainted_bgr = lama_inpaint(img_bgr, mask_full, model_path=str(model_path), device="cpu")
+            if inpainted_bgr is not None:
+                inpainting_method = "lama"
+            else:
+                print("[LaMa] predict.inpaint() returned None (check server logs for exception from bin.predict)", flush=True)
+        else:
+            print(f"[LaMa] Model path not found: {model_path}", flush=True)
+    else:
+        print("[LaMa] bin.predict.inpaint not available (import failed). Check traceback above.", flush=True)
     if inpainted_bgr is None:
-        # Fallback: LaMa script not available or failed — use in-process inpainting
+        # Fallback: LaMa not available or failed — use in-process inpainting
         inpainted_bgr = _attempt_inpaint_with_lama(img_bgr, mask_full)
 
     # prepare outputs: final (RGB PNG), mask PNG (single channel)
@@ -455,6 +433,7 @@ async def process_with_roi(
         "final": final_b64,
         "mask": mask_b64,
         "annotated": annotated_b64,
+        "inpainting_method": inpainting_method,
         "image_width": w_orig,
         "image_height": h_orig,
         "text_regions": text_regions,

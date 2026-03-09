@@ -216,7 +216,7 @@ def _attempt_inpaint_with_lama(original_bgr: np.ndarray, mask_uint8: np.ndarray)
         return original_bgr
 
 
-@app.post("/process_roi", summary="Inpaint user-cropped ROI on full image using LaMa")
+@app.post("/process_roi", summary="Process full image using ROI for OCR -> build full-image mask -> inpaint full image")
 async def process_with_roi(
     file: UploadFile = File(...),
     polygon: str = Form(...),
@@ -226,11 +226,10 @@ async def process_with_roi(
     """
     Expects:
     - file: full original image (multipart)
-    - polygon: JSON array of 4 points [{x,y}, ...] in image coordinates (the user-cropped ROI)
-    - padding: optional pixels to expand the ROI mask before inpainting (0 = use ROI as-is)
-    - min_confidence: minimum OCR confidence (used only for optional annotated/text_regions)
-    The mask passed to LaMa is the user-cropped ROI (polygon), not OCR-detected boxes.
-    Returns JSON with base64 fields: final (inpainted PNG), mask (ROI mask PNG), annotated (optional)
+    - polygon: JSON array of 3+ points [{x:...,y:...}, ...] in image natural pixel coordinates (4 points = quad rectification; other = ROI mask)
+    - padding: optional pixels to expand mask (0 = use OCR boxes as-is, no padding)
+    - min_confidence: minimum OCR confidence to include
+    Returns JSON with base64 fields: final (full-size inpainted PNG), mask (full-size PNG), annotated (optional)
     """
     if file.content_type.split("/")[0] != "image":
         raise HTTPException(status_code=400, detail="Uploaded file must be an image")
@@ -245,66 +244,138 @@ async def process_with_roi(
         raise HTTPException(status_code=400, detail=f"Failed to decode image: {e}")
     h_orig, w_orig = img_bgr.shape[:2]
 
-    # parse polygon
+    # parse polygon (3+ points; 4 points use quad rectification, other use full-image OCR + polygon ROI)
     try:
         poly = json.loads(polygon)
-        if not isinstance(poly, list) or len(poly) != 4:
-            raise ValueError("polygon must be a list of 4 points")
+        if not isinstance(poly, list) or len(poly) < 3:
+            raise ValueError("polygon must be a list of at least 3 points")
         pts = [(float(p["x"]), float(p["y"])) for p in poly]
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid polygon: {e}")
 
-    ordered = _order_quad(pts)
-    rect_w, rect_h = _compute_rect_size(ordered)
-
-    src = np.array(ordered, dtype=np.float32)
-    dst = np.array([[0, 0], [rect_w - 1, 0], [rect_w - 1, rect_h - 1], [0, rect_h - 1]], dtype=np.float32)
-    M = cv2.getPerspectiveTransform(src, dst)
-    Minv = cv2.getPerspectiveTransform(dst, src)
-
-    crop = cv2.warpPerspective(img_bgr, M, (rect_w, rect_h), flags=cv2.INTER_LINEAR)
-    crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-
-    # Full-image mask = user-cropped ROI (polygon), not OCR boxes. LaMa gets this mask.
-    mask_full = np.zeros((h_orig, w_orig), dtype=np.uint8)
-    roi_pts = np.array(ordered, dtype=np.int32).reshape((-1, 1, 2))
-    cv2.fillPoly(mask_full, [roi_pts], 255)
-    if padding > 0:
-        k = max(1, int(padding))
-        kernel = np.ones((k, k), np.uint8)
-        mask_full = cv2.dilate(mask_full, kernel, iterations=1)
-    mask_full = ((mask_full > 0).astype(np.uint8)) * 255
-
-    # OCR only for optional annotated image and text_regions in the response (not for the mask)
+    score_thresh = float(min_confidence) / 100.0
     valid_boxes = []
-    try:
-        ocr_results = ocr_model.ocr(crop_rgb, cls=True)
-        score_thresh = float(min_confidence) / 100.0
-        flat_results = []
+    mask_full = np.zeros((h_orig, w_orig), dtype=np.uint8)
+    use_quad = len(pts) == 4
+    crop_rgb = None
+    Minv = None
+
+    def _flatten_ocr(ocr_results):
+        flat = []
         for page in (ocr_results or []):
             if page is None:
                 continue
             if isinstance(page, list) and page and isinstance(page[0], list):
-                flat_results.extend(page)
+                flat.extend(page)
             else:
-                flat_results.append(page)
+                flat.append(page)
+        return flat
+
+    if use_quad:
+        # 4-point path: rectified crop -> OCR on crop -> warp mask back to full image
+        ordered = _order_quad(pts)
+        rect_w, rect_h = _compute_rect_size(ordered)
+        src = np.array(ordered, dtype=np.float32)
+        dst = np.array([[0, 0], [rect_w - 1, 0], [rect_w - 1, rect_h - 1], [0, rect_h - 1]], dtype=np.float32)
+        M = cv2.getPerspectiveTransform(src, dst)
+        Minv = cv2.getPerspectiveTransform(dst, src)
+        crop = cv2.warpPerspective(img_bgr, M, (rect_w, rect_h), flags=cv2.INTER_LINEAR)
+        crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        try:
+            ocr_results = ocr_model.ocr(crop_rgb, cls=True)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"OCR failed: {e}")
+        flat_results = _flatten_ocr(ocr_results)
         for res in flat_results:
             try:
                 box = res[0]
                 rec = res[1]
                 if isinstance(rec, (list, tuple)) and len(rec) >= 2:
-                    text = str(rec[0]).strip()
-                    score = float(rec[1])
+                    text, score = str(rec[0]).strip(), float(rec[1])
                 else:
-                    text = str(rec).strip()
-                    score = 1.0
+                    text, score = str(rec).strip(), 1.0
             except Exception:
                 continue
             if not text or score < score_thresh:
                 continue
             valid_boxes.append((box, text, score))
-    except Exception as e:
-        pass  # OCR optional; mask is already the ROI
+            try:
+                crop_mask = np.zeros((rect_h, rect_w), dtype=np.uint8)
+                box_pts = np.array(box, dtype=np.int32).reshape((-1, 1, 2))
+                cv2.fillPoly(crop_mask, [box_pts], 255)
+                if padding > 0:
+                    k = max(1, int(padding))
+                    kernel = np.ones((k, k), np.uint8)
+                    crop_mask = cv2.dilate(crop_mask, kernel, iterations=1)
+                warped = cv2.warpPerspective(crop_mask, Minv, (w_orig, h_orig), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+                mask_full = cv2.bitwise_or(mask_full, warped)
+            except Exception:
+                try:
+                    box_arr = np.array(box, dtype=np.float32).reshape(1, -1, 2)
+                    mapped = cv2.perspectiveTransform(box_arr, Minv).reshape(-1, 2).astype(np.int32)
+                    cv2.fillPoly(mask_full, [mapped], color=255)
+                except Exception:
+                    xs = [int(p[0]) for p in box]
+                    ys = [int(p[1]) for p in box]
+                    lx = max(0, min(xs) - padding)
+                    ty = max(0, min(ys) - padding)
+                    rx = min(rect_w - 1, max(xs) + padding)
+                    by = min(rect_h - 1, max(ys) + padding)
+                    box_corners = np.array([[[lx, ty]], [[rx, ty]], [[rx, by]], [[lx, by]]], dtype=np.float32)
+                    mapped = cv2.perspectiveTransform(box_corners, Minv).reshape(-1, 2).astype(np.int32)
+                    cv2.fillPoly(mask_full, [mapped], color=255)
+    else:
+        # N-point path: OCR on full image, keep only boxes whose center is inside the polygon
+        poly_contour = np.array(pts, dtype=np.float32).reshape((-1, 1, 2))
+        poly_mask_roi = np.zeros((h_orig, w_orig), dtype=np.uint8)
+        cv2.fillPoly(poly_mask_roi, [np.array(pts, dtype=np.int32).reshape((-1, 1, 2))], 255)
+        try:
+            ocr_results = ocr_model.ocr(img_rgb, cls=True)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"OCR failed: {e}")
+        flat_results = _flatten_ocr(ocr_results)
+        for res in flat_results:
+            try:
+                box = res[0]
+                rec = res[1]
+                if isinstance(rec, (list, tuple)) and len(rec) >= 2:
+                    text, score = str(rec[0]).strip(), float(rec[1])
+                else:
+                    text, score = str(rec).strip(), 1.0
+            except Exception:
+                continue
+            if not text or score < score_thresh:
+                continue
+            # box is in full-image coordinates; test if center lies inside ROI polygon
+            cx = sum(p[0] for p in box) / len(box)
+            cy = sum(p[1] for p in box) / len(box)
+            if cv2.pointPolygonTest(poly_contour, (cx, cy), False) < 0:
+                continue
+            valid_boxes.append((box, text, score))
+            try:
+                box_mask = np.zeros((h_orig, w_orig), dtype=np.uint8)
+                box_pts = np.array(box, dtype=np.int32).reshape((-1, 1, 2))
+                cv2.fillPoly(box_mask, [box_pts], 255)
+                if padding > 0:
+                    k = max(1, int(padding))
+                    kernel = np.ones((k, k), np.uint8)
+                    box_mask = cv2.dilate(box_mask, kernel, iterations=1)
+                mask_full = cv2.bitwise_or(mask_full, box_mask)
+            except Exception:
+                pass
+        mask_full = cv2.bitwise_and(mask_full, poly_mask_roi)
+
+    print("OCR detected: ", len(valid_boxes), " boxes inside ROI")
+
+    # Morphological cleanup to ensure a strict binary mask:
+    # - dilate then erode (close) to fill small gaps without producing anti-aliased values
+    if padding > 0:
+        k = max(1, int(padding / 2))
+        kernel = np.ones((k, k), np.uint8)
+        mask_full = cv2.dilate(mask_full, kernel, iterations=1)
+        mask_full = cv2.erode(mask_full, kernel, iterations=1)
+    # Ensure strictly binary 0 or 255
+    mask_full = ((mask_full > 0).astype(np.uint8)) * 255
 
     # Run object removal via LaMa: pass full image + full mask to predict.inpaint()
     inpainted_bgr = None
@@ -335,27 +406,40 @@ async def process_with_roi(
     mask_rgb = cv2.cvtColor(mask_full, cv2.COLOR_GRAY2RGB)
     mask_b64 = _np_to_b64_png(mask_rgb)
 
-    # optional annotated image: draw detected boxes onto crop and warp back for inspection
+    # optional annotated image: draw detected boxes for inspection
+    vis_annot_rgb = None
     try:
-        vis_crop = crop_rgb.copy()
-        for box, text, score in valid_boxes:
-            pts = np.array(box, dtype=np.int32).reshape((-1, 1, 2))
-            cv2.polylines(vis_crop, [pts], isClosed=True, color=(255, 0, 0), thickness=2)
-        vis_annot = cv2.warpPerspective(cv2.cvtColor(vis_crop, cv2.COLOR_RGB2BGR), Minv, (w_orig, h_orig), flags=cv2.INTER_LINEAR)
-        vis_annot_rgb = cv2.cvtColor(vis_annot, cv2.COLOR_BGR2RGB)
-        annotated_b64 = _np_to_b64_png(vis_annot_rgb)
+        if use_quad and crop_rgb is not None and Minv is not None:
+            vis_crop = crop_rgb.copy()
+            for box, text, score in valid_boxes:
+                pts = np.array(box, dtype=np.int32).reshape((-1, 1, 2))
+                cv2.polylines(vis_crop, [pts], isClosed=True, color=(255, 0, 0), thickness=2)
+            vis_annot = cv2.warpPerspective(cv2.cvtColor(vis_crop, cv2.COLOR_RGB2BGR), Minv, (w_orig, h_orig), flags=cv2.INTER_LINEAR)
+            vis_annot_rgb = cv2.cvtColor(vis_annot, cv2.COLOR_BGR2RGB)
+            annotated_b64 = _np_to_b64_png(vis_annot_rgb)
+        else:
+            vis_annot_rgb = img_rgb.copy()
+            for box, text, score in valid_boxes:
+                pts = np.array(box, dtype=np.int32).reshape((-1, 1, 2))
+                cv2.polylines(vis_annot_rgb, [pts], isClosed=True, color=(255, 0, 0), thickness=2)
+            annotated_b64 = _np_to_b64_png(vis_annot_rgb)
     except Exception:
         annotated_b64 = None
+        vis_annot_rgb = None
 
     # Build text_regions: each box in full-image coordinates for UI overlay
     text_regions = []
     for box, text, score in valid_boxes:
-        box_arr = np.array(box, dtype=np.float32).reshape(1, -1, 2)
-        box_full = cv2.perspectiveTransform(box_arr, Minv).reshape(-1, 2)
+        if use_quad and Minv is not None:
+            box_arr = np.array(box, dtype=np.float32).reshape(1, -1, 2)
+            box_full = cv2.perspectiveTransform(box_arr, Minv).reshape(-1, 2)
+            box_list = box_full.tolist()
+        else:
+            box_list = [[float(p[0]), float(p[1])] for p in box]
         text_regions.append({
             "text": text,
             "score": round(float(score), 4),
-            "box": [[float(x), float(y)] for x, y in box_full.tolist()],
+            "box": [[float(x), float(y)] for x, y in box_list],
         })
 
     # Save outputs to disk for later inspection
@@ -382,7 +466,7 @@ async def process_with_roi(
             cv2.imwrite(str(mask_path), cv2.cvtColor(mask_rgb, cv2.COLOR_RGB2BGR))
 
         # save annotated if present
-        if annotated_b64:
+        if annotated_b64 and vis_annot_rgb is not None:
             try:
                 Image.fromarray(vis_annot_rgb).save(annotated_path, format="PNG")
             except Exception:

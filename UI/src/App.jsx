@@ -983,21 +983,6 @@ export default function App() {
                       />
                     )}
                   </svg>
-
-                  {/* markers for saved polygons */}
-                  {polygons.flatMap((poly, pi) =>
-                    poly.points.map((p, i) => (
-                      <div key={`${poly.id}-${i}`} className="poly-point" style={{ left: `${p.dx}px`, top: `${p.dy}px` }}>
-                        {pi + 1}.{i + 1}
-                      </div>
-                    ))
-                  )}
-                  {/* markers for current polygon */}
-                  {polygonPoints.map((p, i) => (
-                    <div key={i} className="poly-point" style={{ left: `${p.dx}px`, top: `${p.dy}px` }}>
-                      {i + 1}
-                    </div>
-                  ))}
                 </div>
               </>
             ) : (
@@ -1120,27 +1105,27 @@ export default function App() {
             </button>
             <button
               onClick={async () => {
-                // Process full original image using ROI polygons (or last polygon)
+                // Process full original image using ALL ROI polygons
                 if (!selectedFile) {
                   alert("Select the original image (click a thumbnail) before processing.");
                   return;
                 }
-                // pick ROI: current polygon (3+ points) or last saved polygon
-                let sourcePoly = null;
-                if (polygonPoints.length >= 3) sourcePoly = polygonPoints;
-                else if (polygons.length > 0) sourcePoly = polygons[polygons.length - 1].points;
-                if (!sourcePoly || sourcePoly.length < 3) {
-                  alert("Draw at least 3 points to define ROI (close by clicking near the first point), or use a saved polygon.");
+                // Collect all polygons: saved ones + current if 3+ points
+                const allPolys = [...polygons.map(p => p.points)];
+                if (polygonPoints.length >= 3) allPolys.push(polygonPoints);
+                if (allPolys.length === 0) {
+                  alert("Draw at least one polygon (min 3 points; click near the first point to close) to process.");
                   return;
                 }
                 try {
                   setProcessing(true);
-                  const polyForServer = sourcePoly.map(p => ({ x: Math.round(p.nx), y: Math.round(p.ny) }));
+                  // Convert all polygons to server format: array of polygons, each polygon is array of {x, y}
+                  const polygonsForServer = allPolys.map(poly => 
+                    poly.map(p => ({ x: Math.round(p.nx), y: Math.round(p.ny) }))
+                  );
                   const form = new FormData();
                   form.append("file", selectedFile, selectedFile.name || "original.png");
-                  form.append("polygon", JSON.stringify(polyForServer));
-                  form.append("padding", "15");
-                  form.append("min_confidence", "30");
+                  form.append("polygons", JSON.stringify(polygonsForServer));
                   const res = await fetch("http://127.0.0.1:8000/process_roi", {
                     method: "POST",
                     body: form
@@ -1158,16 +1143,10 @@ export default function App() {
                   if (json.image_width != null && json.image_height != null) {
                     setFullFinalImageSize({ width: json.image_width, height: json.image_height });
                   }
-                  const regions = (json.text_regions || []).map((r, i) => ({
-                    id: cryptoRandomId(),
-                    text: r.text || "",
-                    score: r.score != null ? r.score : 1,
-                    box: Array.isArray(r.box) ? r.box.map(p => [Number(p[0]), Number(p[1])]) : [[0, 0], [0, 0], [0, 0], [0, 0]],
-                  }));
-                  setTextRegions(regions);
-                  // also update processed mask/annotated previews if present
+                  // Clear text regions since we're not using OCR
+                  setTextRegions([]);
+                  // Update processed mask if present
                   if (json.mask) setProcessed(prev => ({ ...prev, mask: "data:image/png;base64," + json.mask }));
-                  if (json.annotated) setProcessed(prev => ({ ...prev, annotated: "data:image/png;base64," + json.annotated }));
                 } catch (err) {
                   console.error("process_roi failed", err);
                   alert("Full inpaint failed: " + err.message);

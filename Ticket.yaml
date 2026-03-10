@@ -1,0 +1,61 @@
+title: Create Pipeline for Multi-Bounding Box OCR and Inpainting
+
+description: >
+  Develop a pipeline that allows users to draw multiple bounding boxes on a single
+  image and process them for text extraction and inpainting. The backend should
+  accept the image along with bounding box coordinates, perform OCR on each region,
+  mask the regions, run an inpainting model, and return the results in JSON format.
+
+requirements:
+  frontend:
+    - Allow users to draw multiple bounding boxes on a single image.
+    - Send the original image and list of bounding box coordinates to the backend API.
+
+  backend:
+    - Accept the full image and list of bounding boxes from the request.
+    - Process bounding boxes in parallel for efficient execution.
+    - Extract text from each bounding box using OCR.
+
+  masking:
+    - Generate ROI masks for the provided bounding boxes.
+    - Mask the bounding box regions in the image before sending to the inpainting model.
+
+  inpainting:
+    - Run the inpainting model on masked regions to remove the original text.
+
+  font_color_detection:
+    - Detect the font color from each text region.
+
+api_endpoint:
+  method: POST
+  path: /process-image
+  request:
+    image: full_image_file
+    bounding_boxes:
+      - [x1, y1, x2, y2]
+
+processing_steps:
+  - Receive full image and bounding boxes.
+  - Run OCR on each bounding box region in parallel.
+  - Extract detected text.
+  - Detect font color from text regions.
+  - Create masks for the bounding boxes.
+  - Pass masked regions to the inpainting model.
+  - Generate final inpainted image.
+
+response:
+  format: json
+  schema:
+    inpainted_image: base64_or_url
+    results:
+      - bbox: [x1, y1, x2, y2]
+        detected_text: string
+        font_color: hex_color
+
+acceptance_criteria:
+  - User can submit multiple bounding boxes for a single image.
+  - Backend processes bounding boxes concurrently.
+  - OCR successfully extracts text from each bounding box.
+  - Masking correctly isolates bounding box regions.
+  - Inpainting removes text from the masked areas.
+  - API returns JSON with inpainted image, detected text, and font color.

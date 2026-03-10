@@ -216,20 +216,16 @@ def _attempt_inpaint_with_lama(original_bgr: np.ndarray, mask_uint8: np.ndarray)
         return original_bgr
 
 
-@app.post("/process_roi", summary="Process full image using ROI for OCR -> build full-image mask -> inpaint full image")
+@app.post("/process_roi", summary="Process full image using ROI polygons -> build full-image mask -> inpaint full image")
 async def process_with_roi(
     file: UploadFile = File(...),
-    polygon: str = Form(...),
-    padding: int = Form(0),
-    min_confidence: int = Form(30),
+    polygons: str = Form(...),
 ):
     """
     Expects:
     - file: full original image (multipart)
-    - polygon: JSON array of 3+ points [{x:...,y:...}, ...] in image natural pixel coordinates (4 points = quad rectification; other = ROI mask)
-    - padding: optional pixels to expand mask (0 = use OCR boxes as-is, no padding)
-    - min_confidence: minimum OCR confidence to include
-    Returns JSON with base64 fields: final (full-size inpainted PNG), mask (full-size PNG), annotated (optional)
+    - polygons: JSON array of polygons, each polygon is array of points [{x:...,y:...}, ...] in image natural pixel coordinates
+    Returns JSON with base64 fields: final (full-size inpainted PNG), mask (full-size PNG)
     """
     if file.content_type.split("/")[0] != "image":
         raise HTTPException(status_code=400, detail="Uploaded file must be an image")
@@ -244,136 +240,36 @@ async def process_with_roi(
         raise HTTPException(status_code=400, detail=f"Failed to decode image: {e}")
     h_orig, w_orig = img_bgr.shape[:2]
 
-    # parse polygon (3+ points; 4 points use quad rectification, other use full-image OCR + polygon ROI)
+    # parse polygons (array of polygons, each polygon is array of points)
     try:
-        poly = json.loads(polygon)
-        if not isinstance(poly, list) or len(poly) < 3:
-            raise ValueError("polygon must be a list of at least 3 points")
-        pts = [(float(p["x"]), float(p["y"])) for p in poly]
+        polygons_data = json.loads(polygons)
+        if not isinstance(polygons_data, list) or len(polygons_data) == 0:
+            raise ValueError("polygons must be a non-empty list of polygons")
+        # Validate each polygon has at least 3 points
+        for i, poly in enumerate(polygons_data):
+            if not isinstance(poly, list) or len(poly) < 3:
+                raise ValueError(f"Polygon {i} must be a list of at least 3 points")
+        # Convert to list of point tuples
+        polygons_list = [[(float(p["x"]), float(p["y"])) for p in poly] for poly in polygons_data]
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid polygon: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid polygons: {e}")
 
-    score_thresh = float(min_confidence) / 100.0
-    valid_boxes = []
+    # Create mask from all polygons (skip OCR processing)
     mask_full = np.zeros((h_orig, w_orig), dtype=np.uint8)
-    use_quad = len(pts) == 4
-    crop_rgb = None
-    Minv = None
-
-    def _flatten_ocr(ocr_results):
-        flat = []
-        for page in (ocr_results or []):
-            if page is None:
-                continue
-            if isinstance(page, list) and page and isinstance(page[0], list):
-                flat.extend(page)
-            else:
-                flat.append(page)
-        return flat
-
-    if use_quad:
-        # 4-point path: rectified crop -> OCR on crop -> warp mask back to full image
-        ordered = _order_quad(pts)
-        rect_w, rect_h = _compute_rect_size(ordered)
-        src = np.array(ordered, dtype=np.float32)
-        dst = np.array([[0, 0], [rect_w - 1, 0], [rect_w - 1, rect_h - 1], [0, rect_h - 1]], dtype=np.float32)
-        M = cv2.getPerspectiveTransform(src, dst)
-        Minv = cv2.getPerspectiveTransform(dst, src)
-        crop = cv2.warpPerspective(img_bgr, M, (rect_w, rect_h), flags=cv2.INTER_LINEAR)
-        crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    
+    # Fill each polygon in the mask
+    for pts in polygons_list:
         try:
-            ocr_results = ocr_model.ocr(crop_rgb, cls=True)
+            # Convert polygon points to integer coordinates
+            poly_pts = np.array(pts, dtype=np.int32).reshape((-1, 1, 2))
+            # Fill the polygon with white (255) in the mask
+            cv2.fillPoly(mask_full, [poly_pts], 255)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"OCR failed: {e}")
-        flat_results = _flatten_ocr(ocr_results)
-        for res in flat_results:
-            try:
-                box = res[0]
-                rec = res[1]
-                if isinstance(rec, (list, tuple)) and len(rec) >= 2:
-                    text, score = str(rec[0]).strip(), float(rec[1])
-                else:
-                    text, score = str(rec).strip(), 1.0
-            except Exception:
-                continue
-            if not text or score < score_thresh:
-                continue
-            valid_boxes.append((box, text, score))
-            try:
-                crop_mask = np.zeros((rect_h, rect_w), dtype=np.uint8)
-                box_pts = np.array(box, dtype=np.int32).reshape((-1, 1, 2))
-                cv2.fillPoly(crop_mask, [box_pts], 255)
-                if padding > 0:
-                    k = max(1, int(padding))
-                    kernel = np.ones((k, k), np.uint8)
-                    crop_mask = cv2.dilate(crop_mask, kernel, iterations=1)
-                warped = cv2.warpPerspective(crop_mask, Minv, (w_orig, h_orig), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-                mask_full = cv2.bitwise_or(mask_full, warped)
-            except Exception:
-                try:
-                    box_arr = np.array(box, dtype=np.float32).reshape(1, -1, 2)
-                    mapped = cv2.perspectiveTransform(box_arr, Minv).reshape(-1, 2).astype(np.int32)
-                    cv2.fillPoly(mask_full, [mapped], color=255)
-                except Exception:
-                    xs = [int(p[0]) for p in box]
-                    ys = [int(p[1]) for p in box]
-                    lx = max(0, min(xs) - padding)
-                    ty = max(0, min(ys) - padding)
-                    rx = min(rect_w - 1, max(xs) + padding)
-                    by = min(rect_h - 1, max(ys) + padding)
-                    box_corners = np.array([[[lx, ty]], [[rx, ty]], [[rx, by]], [[lx, by]]], dtype=np.float32)
-                    mapped = cv2.perspectiveTransform(box_corners, Minv).reshape(-1, 2).astype(np.int32)
-                    cv2.fillPoly(mask_full, [mapped], color=255)
-    else:
-        # N-point path: OCR on full image, keep only boxes whose center is inside the polygon
-        poly_contour = np.array(pts, dtype=np.float32).reshape((-1, 1, 2))
-        poly_mask_roi = np.zeros((h_orig, w_orig), dtype=np.uint8)
-        cv2.fillPoly(poly_mask_roi, [np.array(pts, dtype=np.int32).reshape((-1, 1, 2))], 255)
-        try:
-            ocr_results = ocr_model.ocr(img_rgb, cls=True)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"OCR failed: {e}")
-        flat_results = _flatten_ocr(ocr_results)
-        for res in flat_results:
-            try:
-                box = res[0]
-                rec = res[1]
-                if isinstance(rec, (list, tuple)) and len(rec) >= 2:
-                    text, score = str(rec[0]).strip(), float(rec[1])
-                else:
-                    text, score = str(rec).strip(), 1.0
-            except Exception:
-                continue
-            if not text or score < score_thresh:
-                continue
-            # box is in full-image coordinates; test if center lies inside ROI polygon
-            cx = sum(p[0] for p in box) / len(box)
-            cy = sum(p[1] for p in box) / len(box)
-            if cv2.pointPolygonTest(poly_contour, (cx, cy), False) < 0:
-                continue
-            valid_boxes.append((box, text, score))
-            try:
-                box_mask = np.zeros((h_orig, w_orig), dtype=np.uint8)
-                box_pts = np.array(box, dtype=np.int32).reshape((-1, 1, 2))
-                cv2.fillPoly(box_mask, [box_pts], 255)
-                if padding > 0:
-                    k = max(1, int(padding))
-                    kernel = np.ones((k, k), np.uint8)
-                    box_mask = cv2.dilate(box_mask, kernel, iterations=1)
-                mask_full = cv2.bitwise_or(mask_full, box_mask)
-            except Exception:
-                pass
-        mask_full = cv2.bitwise_and(mask_full, poly_mask_roi)
+            print(f"Warning: Failed to process polygon: {e}", flush=True)
+            continue
+    
+    print(f"Created mask from {len(polygons_list)} polygon(s)")
 
-    print("OCR detected: ", len(valid_boxes), " boxes inside ROI")
-
-    # Morphological cleanup to ensure a strict binary mask:
-    # - dilate then erode (close) to fill small gaps without producing anti-aliased values
-    if padding > 0:
-        k = max(1, int(padding / 2))
-        kernel = np.ones((k, k), np.uint8)
-        mask_full = cv2.dilate(mask_full, kernel, iterations=1)
-        mask_full = cv2.erode(mask_full, kernel, iterations=1)
     # Ensure strictly binary 0 or 255
     mask_full = ((mask_full > 0).astype(np.uint8)) * 255
 
@@ -406,42 +302,6 @@ async def process_with_roi(
     mask_rgb = cv2.cvtColor(mask_full, cv2.COLOR_GRAY2RGB)
     mask_b64 = _np_to_b64_png(mask_rgb)
 
-    # optional annotated image: draw detected boxes for inspection
-    vis_annot_rgb = None
-    try:
-        if use_quad and crop_rgb is not None and Minv is not None:
-            vis_crop = crop_rgb.copy()
-            for box, text, score in valid_boxes:
-                pts = np.array(box, dtype=np.int32).reshape((-1, 1, 2))
-                cv2.polylines(vis_crop, [pts], isClosed=True, color=(255, 0, 0), thickness=2)
-            vis_annot = cv2.warpPerspective(cv2.cvtColor(vis_crop, cv2.COLOR_RGB2BGR), Minv, (w_orig, h_orig), flags=cv2.INTER_LINEAR)
-            vis_annot_rgb = cv2.cvtColor(vis_annot, cv2.COLOR_BGR2RGB)
-            annotated_b64 = _np_to_b64_png(vis_annot_rgb)
-        else:
-            vis_annot_rgb = img_rgb.copy()
-            for box, text, score in valid_boxes:
-                pts = np.array(box, dtype=np.int32).reshape((-1, 1, 2))
-                cv2.polylines(vis_annot_rgb, [pts], isClosed=True, color=(255, 0, 0), thickness=2)
-            annotated_b64 = _np_to_b64_png(vis_annot_rgb)
-    except Exception:
-        annotated_b64 = None
-        vis_annot_rgb = None
-
-    # Build text_regions: each box in full-image coordinates for UI overlay
-    text_regions = []
-    for box, text, score in valid_boxes:
-        if use_quad and Minv is not None:
-            box_arr = np.array(box, dtype=np.float32).reshape(1, -1, 2)
-            box_full = cv2.perspectiveTransform(box_arr, Minv).reshape(-1, 2)
-            box_list = box_full.tolist()
-        else:
-            box_list = [[float(p[0]), float(p[1])] for p in box]
-        text_regions.append({
-            "text": text,
-            "score": round(float(score), 4),
-            "box": [[float(x), float(y)] for x, y in box_list],
-        })
-
     # Save outputs to disk for later inspection
     try:
         base = Path(__file__).resolve().parents[1]
@@ -450,7 +310,6 @@ async def process_with_roi(
         uid = uuid4().hex[:8]
         final_path = out_dir / f"final_{uid}.png"
         mask_path = out_dir / f"mask_{uid}.png"
-        annotated_path = out_dir / f"annotated_{uid}.png" if annotated_b64 else None
 
         # save final_rgb (RGB)
         try:
@@ -465,12 +324,6 @@ async def process_with_roi(
         except Exception:
             cv2.imwrite(str(mask_path), cv2.cvtColor(mask_rgb, cv2.COLOR_RGB2BGR))
 
-        # save annotated if present
-        if annotated_b64 and vis_annot_rgb is not None:
-            try:
-                Image.fromarray(vis_annot_rgb).save(annotated_path, format="PNG")
-            except Exception:
-                cv2.imwrite(str(annotated_path), cv2.cvtColor(vis_annot_rgb, cv2.COLOR_RGB2BGR))
     except Exception as e:
         # Log but do not fail the request
         print("Failed to save outputs:", e)
@@ -478,15 +331,12 @@ async def process_with_roi(
     return JSONResponse({
         "final": final_b64,
         "mask": mask_b64,
-        "annotated": annotated_b64,
         "inpainting_method": inpainting_method,
         "image_width": w_orig,
         "image_height": h_orig,
-        "text_regions": text_regions,
         "paths": {
             "final": str(final_path) if 'final_path' in locals() else None,
             "mask": str(mask_path) if 'mask_path' in locals() else None,
-            "annotated": str(annotated_path) if 'annotated_path' in locals() else None
         }
     })
 

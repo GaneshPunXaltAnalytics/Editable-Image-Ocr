@@ -1,346 +1,221 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pathlib import Path
-import tempfile
-import shutil
-import io
-import sys
-import zipfile
-import base64
-import importlib.util
-import os
-from PIL import Image
-import json
-import numpy as np
-import cv2
-from paddleocr import PaddleOCR
-# for saving outputs
-from uuid import uuid4
-from datetime import datetime
-# initialize OCR model once (CPU by default). Set use_gpu=True if GPU available.
-ocr_model = PaddleOCR(use_angle_cls=True, lang='en', det_db_unclip_ratio=2.0)
-from fastapi import Form
-from typing import List, Optional, Tuple
+"""
+Image Inpainting API — production-ready FastAPI service.
 
-app = FastAPI(title="Text Removal API")
-# Enable CORS for the frontend dev server
+Key design decisions:
+  - LaMa model is imported ONCE at startup via lifespan, not re-imported on every request.
+  - sys.path is mutated only once at module load time, never inside a request.
+  - Structured logging replaces bare print() calls.
+  - Input validation is explicit and raises clear HTTP errors.
+  - No use of locals() for control flow.
+  - All file I/O uses context managers and explicit error handling.
+  - Helper functions are pure and independently testable.
+"""
+
+from __future__ import annotations
+
+import io
+import logging
+import os
+import sys
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
+
+import cv2
+import numpy as np
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from PIL import Image
+
+# Load environment variables from .env file
+load_dotenv()
+
+from helper import (
+    build_mask_from_polygons,
+    inpaint,
+    np_to_b64_png,
+    parse_polygons,
+    save_outputs_to_disk,
+)
+
+# ---------------------------------------------------------------------------
+# Environment Configuration
+# ---------------------------------------------------------------------------
+# Resolve project root once at import time so it is never recomputed per request
+PROJECT_ROOT = Path(os.getenv("PROJECT_ROOT", str(Path(__file__).resolve().parents[1])))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# Load configuration from environment variables with defaults
+LAMA_MODEL_PATH_STR = os.getenv("LAMA_MODEL_PATH", "pretrained_models/big-lama")
+LAMA_MODEL_PATH = (
+    Path(LAMA_MODEL_PATH_STR) if Path(LAMA_MODEL_PATH_STR).is_absolute()
+    else PROJECT_ROOT / LAMA_MODEL_PATH_STR
+)
+
+OUTPUTS_ROOT_STR = os.getenv("OUTPUTS_ROOT", "saved_outputs")
+OUTPUTS_ROOT = (
+    Path(OUTPUTS_ROOT_STR) if Path(OUTPUTS_ROOT_STR).is_absolute()
+    else PROJECT_ROOT / OUTPUTS_ROOT_STR
+)
+
+CORS_ORIGINS_STR = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
+CORS_ORIGINS = [origin.strip() for origin in CORS_ORIGINS_STR.split(",") if origin.strip()]
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+API_TITLE = os.getenv("API_TITLE", "Image Inpainting API")
+DEVICE = os.getenv("DEVICE", "cpu")
+
+# ---------------------------------------------------------------------------
+# Logging — use structured logging; replace with your log aggregator adapter
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("text_removal_api")
+
+# ---------------------------------------------------------------------------
+# Module-level singletons — populated during lifespan startup
+# ---------------------------------------------------------------------------
+_lama_inpaint_fn: Any = None       # callable or None if LaMa unavailable
+
+
+def _load_lama_inpaint_fn():
+    """
+    Attempt to import bin.predict.inpaint once at startup.
+    Returns the callable or None — callers must handle None gracefully.
+    """
+    try:
+        from bin.predict import inpaint  # noqa: PLC0415
+        logger.info("LaMa inpaint function loaded successfully.")
+        return inpaint
+    except Exception:
+        logger.warning(
+            "Could not import bin.predict.inpaint — LaMa inpainting unavailable; "
+            "will fall back to OpenCV.",
+            exc_info=True,
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Lifespan: load all heavy resources once, before the first request
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _lama_inpaint_fn
+
+    logger.info("Starting up: loading LaMa model…")
+    _lama_inpaint_fn = _load_lama_inpaint_fn()
+
+    if not LAMA_MODEL_PATH.exists():
+        logger.warning("LaMa model directory not found at %s — LaMa inpainting disabled.", LAMA_MODEL_PATH)
+
+    logger.info("Startup complete.")
+    yield
+    logger.info("Shutting down.")
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+app = FastAPI(title=API_TITLE, lifespan=lifespan)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        # add other dev origins if needed
-    ],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-def load_text_removal_module():
-    # Load Other/text_removal.py as a module regardless of package imports
-    base = Path(__file__).resolve().parents[1]
-    module_path = base / "Other" / "text_removal.py"
-    if not module_path.exists():
-        raise FileNotFoundError(f"Expected text_removal.py at {module_path}")
-    spec = importlib.util.spec_from_file_location("text_removal", str(module_path))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
-@app.post("/process", summary="Process cropped image and return original, mask and erased images")
-async def process_image(file: UploadFile = File(...)):
-    if file.content_type.split("/")[0] != "image":
-        raise HTTPException(status_code=400, detail="Uploaded file must be an image")
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
 
-    tr = load_text_removal_module()
-
-    # Create a temporary working directory
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir_path = Path(tmpdir)
-        input_path = tmpdir_path / "input.png"
-        annotated_path = tmpdir_path / "annotated.png"
-        erased_path = tmpdir_path / "erased.png"
-
-        # Save uploaded file
-        with open(input_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-
-        try:
-            # Call the existing function which writes annotated + erased + mask files
-            extract_result = tr.extract_text_and_color(
-                str(input_path),
-                output_path=str(annotated_path),
-                erased_path=str(erased_path),
-                use_word_boxes=True,
-                box_padding=0,
-            )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
-        text_regions = extract_result.get("text_regions", []) if isinstance(extract_result, dict) else []
-
-        # Mask path is derived by text_removal.py (erased_path -> *_mask.png)
-        mask_path = Path(str(erased_path)).with_name(Path(str(erased_path)).name.replace(".png", "_mask.png"))
-
-        # Read generated files and return base64-encoded images in JSON.
-        # Ensure returned images are the same size as the uploaded input (crop).
-        def _b64_ensure_size(path: Path, target_size):
-            try:
-                if not path.exists():
-                    return None
-                with Image.open(path) as im:
-                    if im.size != target_size:
-                        im = im.convert("RGBA")
-                        im = im.resize(target_size, resample=Image.LANCZOS)
-                    buf = io.BytesIO()
-                    im.save(buf, format="PNG")
-                    return base64.b64encode(buf.getvalue()).decode("ascii")
-            except Exception:
-                return None
-
-        # Determine target size from the uploaded input image
-        try:
-            with Image.open(input_path) as in_im:
-                target_size = in_im.size  # (width, height)
-        except Exception:
-            target_size = None
-
-        # original should be returned as-is (the uploaded crop)
-        try:
-            original_b64 = base64.b64encode(input_path.read_bytes()).decode("ascii")
-        except Exception:
-            original_b64 = None
-
-        if target_size:
-            annotated_b64 = _b64_ensure_size(annotated_path, target_size)
-            erased_b64 = _b64_ensure_size(erased_path, target_size)
-            mask_b64 = _b64_ensure_size(mask_path, target_size)
-        else:
-            def _b64(path: Path):
-                try:
-                    data = path.read_bytes()
-                    return base64.b64encode(data).decode("ascii")
-                except Exception:
-                    return None
-            annotated_b64 = _b64(annotated_path) if annotated_path.exists() else None
-            erased_b64 = _b64(erased_path) if erased_path.exists() else None
-            mask_b64 = _b64(mask_path) if mask_path.exists() else None
-
-        out = {
-            "original": original_b64,
-            "annotated": annotated_b64,
-            "mask": mask_b64,
-            "erased": erased_b64,
-            "text_regions": text_regions,
-        }
-        if target_size:
-            out["crop_width"] = target_size[0]
-            out["crop_height"] = target_size[1]
-        return JSONResponse(out)
-
-
-def _order_quad(pts: List[Tuple[float, float]]):
-    # Order arbitrary quad points to TL, TR, BR, BL
-    pts_arr = np.array(pts, dtype=np.float32)
-    s = pts_arr.sum(axis=1)
-    diff = np.diff(pts_arr, axis=1).reshape(-1)
-    tl = pts_arr[np.argmin(s)]
-    br = pts_arr[np.argmax(s)]
-    tr = pts_arr[np.argmin(diff)]
-    bl = pts_arr[np.argmax(diff)]
-    return [tuple(tl.tolist()), tuple(tr.tolist()), tuple(br.tolist()), tuple(bl.tolist())]
-
-
-def _compute_rect_size(ordered: List[Tuple[float, float]]):
-    # compute width and height for rectified crop
-    (tl, tr, br, bl) = ordered
-    wA = np.hypot(br[0] - bl[0], br[1] - bl[1])
-    wB = np.hypot(tr[0] - tl[0], tr[1] - tl[1])
-    hA = np.hypot(tr[0] - br[0], tr[1] - br[1])
-    hB = np.hypot(tl[0] - bl[0], tl[1] - bl[1])
-    width = int(max(wA, wB))
-    height = int(max(hA, hB))
-    return max(1, width), max(1, height)
-
-
-def _np_to_b64_png(img_np: np.ndarray) -> str:
-    # img_np expected in RGB
-    pil = Image.fromarray(img_np)
-    buf = io.BytesIO()
-    pil.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode("ascii")
-
-
-def _get_lama_inpaint():
-    """Import and return the inpaint function from bin.predict, or None if unavailable."""
-    base = Path(__file__).resolve().parents[1]
-    base_str = str(base)
-    if base_str not in sys.path:
-        sys.path.insert(0, base_str)
-    try:
-        from bin.predict import inpaint
-        print("=>> Successfully imported bin.predict.inpaint for LaMa inpainting", flush=True)
-        return inpaint
-    except Exception as e:
-        print(f"[LaMa] Could not import bin.predict.inpaint: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
-        return None
-
-
-def _attempt_inpaint_with_lama(original_bgr: np.ndarray, mask_uint8: np.ndarray) -> np.ndarray:
-    """
-    Try to use LaMa if available (user can integrate), otherwise fallback to OpenCV inpainting.
-    - original_bgr: BGR uint8 image
-    - mask_uint8: single-channel uint8 mask where non-zero = area to inpaint
-    Returns BGR uint8 image
-    """
-    try:
-        # Try to import a user-provided LaMa wrapper function `run_lama` in Other/text_removal.py
-        tr = load_text_removal_module()
-        if hasattr(tr, "run_lama_inpaint"):
-            # Expected signature: run_lama_inpaint(np_image_bgr, mask_uint8) -> np_image_bgr
-            return tr.run_lama_inpaint(original_bgr, mask_uint8)
-    except Exception as e:
-        print("LaMa (text_removal.run_lama_inpaint) not available or failed, falling back to OpenCV inpainting:", e, flush=True)
-        pass
-
-    # Fallback: OpenCV inpaint (Telea)
-    try:
-        inpainted = cv2.inpaint(original_bgr, (mask_uint8 > 0).astype("uint8") * 255, 3, cv2.INPAINT_TELEA)
-        return inpainted
-    except Exception:
-        # As last resort return original
-        return original_bgr
-
-
-@app.post("/process_roi", summary="Process full image using ROI polygons -> build full-image mask -> inpaint full image")
+@app.post(
+    "/process_roi",
+    summary="Inpaint full image within ROI polygons",
+)
 async def process_with_roi(
     file: UploadFile = File(...),
     polygons: str = Form(...),
 ):
     """
-    Expects:
-    - file: full original image (multipart)
-    - polygons: JSON array of polygons, each polygon is array of points [{x:...,y:...}, ...] in image natural pixel coordinates
-    Returns JSON with base64 fields: final (full-size inpainted PNG), mask (full-size PNG)
+    Accepts:
+    - **file**: full original image (multipart/form-data)
+    - **polygons**: JSON array of polygons — each polygon is an array of
+      `{x: number, y: number}` objects in image pixel coordinates.
+
+    Returns JSON with:
+    - **final**: base64 PNG of the inpainted image
+    - **mask**: base64 PNG of the inpaint mask
+    - **inpainting_method**: `"lama"`, `"lama_custom"`, or `"opencv"`
+    - **image_width / image_height**: dimensions of the original image
+    - **paths**: server-side paths where outputs were persisted (for debugging)
     """
     if file.content_type.split("/")[0] != "image":
-        raise HTTPException(status_code=400, detail="Uploaded file must be an image")
+        raise HTTPException(status_code=400, detail="Uploaded file must be an image.")
 
-    # Decode image with PIL so pixels match bin/predict.py CLI (load_image uses PIL)
+    # Parse and validate polygons before touching the image
+    try:
+        polygons_list = parse_polygons(polygons)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # Decode image
     data = await file.read()
     try:
         pil_img = Image.open(io.BytesIO(data)).convert("RGB")
-        img_rgb = np.array(pil_img)
-        img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to decode image: {e}")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to decode image: {exc}") from exc
+
+    img_rgb = np.array(pil_img)
+    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
     h_orig, w_orig = img_bgr.shape[:2]
 
-    # parse polygons (array of polygons, each polygon is array of points)
-    try:
-        polygons_data = json.loads(polygons)
-        if not isinstance(polygons_data, list) or len(polygons_data) == 0:
-            raise ValueError("polygons must be a non-empty list of polygons")
-        # Validate each polygon has at least 3 points
-        for i, poly in enumerate(polygons_data):
-            if not isinstance(poly, list) or len(poly) < 3:
-                raise ValueError(f"Polygon {i} must be a list of at least 3 points")
-        # Convert to list of point tuples
-        polygons_list = [[(float(p["x"]), float(p["y"])) for p in poly] for poly in polygons_data]
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid polygons: {e}")
+    # Build mask
+    mask_full = build_mask_from_polygons(h_orig, w_orig, polygons_list)
+    logger.info("Mask built from %d polygon(s) for a %dx%d image.", len(polygons_list), w_orig, h_orig)
 
-    # Create mask from all polygons (skip OCR processing)
-    mask_full = np.zeros((h_orig, w_orig), dtype=np.uint8)
-    
-    # Fill each polygon in the mask
-    for pts in polygons_list:
-        try:
-            # Convert polygon points to integer coordinates
-            poly_pts = np.array(pts, dtype=np.int32).reshape((-1, 1, 2))
-            # Fill the polygon with white (255) in the mask
-            cv2.fillPoly(mask_full, [poly_pts], 255)
-        except Exception as e:
-            print(f"Warning: Failed to process polygon: {e}", flush=True)
-            continue
-    
-    print(f"Created mask from {len(polygons_list)} polygon(s)")
+    # Inpaint
+    inpainted_bgr, inpainting_method = inpaint(
+        img_bgr,
+        mask_full,
+        lama_inpaint_fn=_lama_inpaint_fn,
+        lama_model_path=LAMA_MODEL_PATH,
+        device=DEVICE,
+    )
+    logger.info("Inpainting complete using method: %s", inpainting_method)
 
-    # Ensure strictly binary 0 or 255
-    mask_full = ((mask_full > 0).astype(np.uint8)) * 255
-
-    # Run object removal via LaMa: pass full image + full mask to predict.inpaint()
-    inpainted_bgr = None
-    inpainting_method = "opencv"  # will be set to "lama" if LaMa succeeds
-    lama_inpaint = _get_lama_inpaint()
-    base = Path(__file__).resolve().parents[1]
-    model_path = base / "pretrained_models" / "big-lama"
-    if lama_inpaint is not None:
-        if model_path.exists():
-            inpainted_bgr = lama_inpaint(img_bgr, mask_full, model_path=str(model_path), device="cpu")
-            if inpainted_bgr is not None:
-                inpainting_method = "lama"
-            else:
-                print("[LaMa] predict.inpaint() returned None (check server logs for exception from bin.predict)", flush=True)
-        else:
-            print(f"[LaMa] Model path not found: {model_path}", flush=True)
-    else:
-        print("[LaMa] bin.predict.inpaint not available (import failed). Check traceback above.", flush=True)
-    if inpainted_bgr is None:
-        # Fallback: LaMa not available or failed — use in-process inpainting
-        inpainted_bgr = _attempt_inpaint_with_lama(img_bgr, mask_full)
-
-    # prepare outputs: final (RGB PNG), mask PNG (single channel)
+    # Prepare response images
     final_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
-    final_b64 = _np_to_b64_png(final_rgb)
-
-    # mask as single-channel PNG (convert to RGB for PNG saving)
     mask_rgb = cv2.cvtColor(mask_full, cv2.COLOR_GRAY2RGB)
-    mask_b64 = _np_to_b64_png(mask_rgb)
 
-    # Save outputs to disk for later inspection
-    try:
-        base = Path(__file__).resolve().parents[1]
-        out_dir = base / "saved_outputs" / datetime.now().strftime("%Y%m%d")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        uid = uuid4().hex[:8]
-        final_path = out_dir / f"final_{uid}.png"
-        mask_path = out_dir / f"mask_{uid}.png"
-
-        # save final_rgb (RGB)
-        try:
-            Image.fromarray(final_rgb).save(final_path, format="PNG")
-        except Exception:
-            # fallback via cv2
-            cv2.imwrite(str(final_path), cv2.cvtColor(final_rgb, cv2.COLOR_RGB2BGR))
-
-        # save mask (mask_rgb is RGB)
-        try:
-            Image.fromarray(mask_rgb).save(mask_path, format="PNG")
-        except Exception:
-            cv2.imwrite(str(mask_path), cv2.cvtColor(mask_rgb, cv2.COLOR_RGB2BGR))
-
-    except Exception as e:
-        # Log but do not fail the request
-        print("Failed to save outputs:", e)
+    final_path, saved_mask_path = save_outputs_to_disk(final_rgb, mask_rgb, OUTPUTS_ROOT)
 
     return JSONResponse({
-        "final": final_b64,
-        "mask": mask_b64,
+        "final": np_to_b64_png(final_rgb),
+        "mask": np_to_b64_png(mask_rgb),
         "inpainting_method": inpainting_method,
         "image_width": w_orig,
         "image_height": h_orig,
         "paths": {
-            "final": str(final_path) if 'final_path' in locals() else None,
-            "mask": str(mask_path) if 'mask_path' in locals() else None,
-        }
+            "final": str(final_path) if final_path else None,
+            "mask": str(saved_mask_path) if saved_mask_path else None,
+        },
     })
 
 
 @app.get("/health", summary="Health check")
 def health():
-    return JSONResponse({"status": "ok"})
+    return JSONResponse({
+        "status": "ok",
+        "lama_available": _lama_inpaint_fn is not None and LAMA_MODEL_PATH.exists(),
+    })

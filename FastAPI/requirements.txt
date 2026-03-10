@@ -5,5 +5,5 @@ opencv-python-headless==4.7.0.72
 numpy==1.26.4
 paddleocr
 paddlepaddle
-numpy==1.26.4
+python-dotenv==1.0.0
 

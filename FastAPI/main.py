@@ -34,6 +34,7 @@ load_dotenv()
 
 from helper import (
     build_mask_from_polygons,
+    extract_text_from_polygons,
     inpaint,
     np_to_b64_png,
     parse_polygons,
@@ -81,6 +82,7 @@ logger = logging.getLogger("text_removal_api")
 # Module-level singletons — populated during lifespan startup
 # ---------------------------------------------------------------------------
 _lama_inpaint_fn: Any = None       # callable or None if LaMa unavailable
+_ocr_model: Any = None              # PaddleOCR model instance
 
 
 def _load_lama_inpaint_fn():
@@ -101,15 +103,34 @@ def _load_lama_inpaint_fn():
         return None
 
 
+def _load_ocr_model():
+    """
+    Initialize PaddleOCR model once at startup.
+    Returns the OCR model instance or None if unavailable.
+    """
+    try:
+        from paddleocr import PaddleOCR
+        ocr = PaddleOCR(use_angle_cls=True, lang='en', det_db_unclip_ratio=2.0, use_gpu=False)
+        logger.info("PaddleOCR model loaded successfully.")
+        return ocr
+    except Exception:
+        logger.warning(
+            "Could not load PaddleOCR — OCR text extraction unavailable.",
+            exc_info=True,
+        )
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Lifespan: load all heavy resources once, before the first request
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _lama_inpaint_fn
+    global _lama_inpaint_fn, _ocr_model
 
-    logger.info("Starting up: loading LaMa model…")
+    logger.info("Starting up: loading models…")
     _lama_inpaint_fn = _load_lama_inpaint_fn()
+    _ocr_model = _load_ocr_model()
 
     if not LAMA_MODEL_PATH.exists():
         logger.warning("LaMa model directory not found at %s — LaMa inpainting disabled.", LAMA_MODEL_PATH)
@@ -158,6 +179,10 @@ async def process_with_roi(
     - **mask**: base64 PNG of the inpaint mask
     - **inpainting_method**: `"lama"`, `"lama_custom"`, or `"opencv"`
     - **image_width / image_height**: dimensions of the original image
+    - **text_regions**: array of extracted text regions, each containing:
+      - **text**: extracted text string
+      - **box**: bounding box coordinates [[x1,y1], [x2,y2], [x3,y3], [x4,y4]] in image coordinates
+      - **score**: OCR confidence score (0-1)
     - **paths**: server-side paths where outputs were persisted (for debugging)
     """
     if file.content_type.split("/")[0] != "image":
@@ -184,6 +209,21 @@ async def process_with_roi(
     mask_full = build_mask_from_polygons(h_orig, w_orig, polygons_list)
     logger.info("Mask built from %d polygon(s) for a %dx%d image.", len(polygons_list), w_orig, h_orig)
 
+    # Extract text from polygons using OCR
+    text_regions = []
+    if _ocr_model is not None:
+        try:
+            text_regions = extract_text_from_polygons(
+                img_rgb=img_rgb,
+                polygons=polygons_list,
+                ocr_model=_ocr_model,
+            )
+            logger.info("Extracted %d text region(s) from polygons.", len(text_regions))
+        except Exception as exc:
+            logger.warning("OCR text extraction failed: %s", exc, exc_info=True)
+    else:
+        logger.warning("OCR model not available — skipping text extraction.")
+
     # Inpaint
     inpainted_bgr, inpainting_method = inpaint(
         img_bgr,
@@ -206,6 +246,7 @@ async def process_with_roi(
         "inpainting_method": inpainting_method,
         "image_width": w_orig,
         "image_height": h_orig,
+        "text_regions": text_regions,
         "paths": {
             "final": str(final_path) if final_path else None,
             "mask": str(saved_mask_path) if saved_mask_path else None,
@@ -218,4 +259,5 @@ def health():
     return JSONResponse({
         "status": "ok",
         "lama_available": _lama_inpaint_fn is not None and LAMA_MODEL_PATH.exists(),
+        "ocr_available": _ocr_model is not None,
     })

@@ -1143,8 +1143,14 @@ export default function App() {
                   if (json.image_width != null && json.image_height != null) {
                     setFullFinalImageSize({ width: json.image_width, height: json.image_height });
                   }
-                  // Clear text regions since we're not using OCR
-                  setTextRegions([]);
+                  // Parse text regions from OCR if available
+                  const regions = (json.text_regions || []).map((r) => ({
+                    id: cryptoRandomId(),
+                    text: r.text != null ? String(r.text) : "",
+                    score: r.score != null ? Number(r.score) : 1,
+                    box: Array.isArray(r.box) ? r.box.map((p) => [Number(p[0]), Number(p[1])]) : [[0, 0], [0, 0], [0, 0], [0, 0]],
+                  }));
+                  setTextRegions(regions);
                   // Update processed mask if present
                   if (json.mask) setProcessed(prev => ({ ...prev, mask: "data:image/png;base64," + json.mask }));
                 } catch (err) {

@@ -365,9 +365,45 @@ def get_dominant_color_simple(pixels, k=2):
         return pixels_array[0].astype(np.uint8)
 
 
+def get_bg_color_from_border(img_bgr, border_pct=0.15):
+    """
+    Sample border strips to get background color.
+    More robust than corners - samples entire border regions.
+    
+    Args:
+        img_bgr: BGR image as numpy array
+        border_pct: Fraction of image to use as border bg sample (default 15%)
+        
+    Returns:
+        Background color as BGR array
+    """
+    h, w = img_bgr.shape[:2]
+    px = max(int(w * border_pct), 5)
+    py = max(int(h * border_pct), 5)
+
+    strips = [
+        img_bgr[0:py, :],           # top
+        img_bgr[h-py:h, :],         # bottom
+        img_bgr[:, 0:px],           # left
+        img_bgr[:, w-px:w],         # right
+    ]
+    
+    border_pixels = np.vstack([s.reshape(-1, 3) for s in strips])
+    
+    # Use KMeans to find dominant border color
+    try:
+        pixels_float = border_pixels.astype(np.float32)
+        km = KMeans(n_clusters=3, n_init=5, random_state=0)
+        km.fit(pixels_float)
+        counts = np.bincount(km.labels_)
+        return km.cluster_centers_[np.argmax(counts)].astype(np.uint8)
+    except Exception:
+        return get_dominant_color_simple(border_pixels, k=2)
+
+
 def get_bg_color_from_corners(img_bgr, corner_pct=0.20):
     """
-    Sample corners to get pure background color.
+    Sample corners to get pure background color (legacy function for compatibility).
     Corners are always background - no text ever starts at corner.
     
     Args:
@@ -377,60 +413,151 @@ def get_bg_color_from_corners(img_bgr, corner_pct=0.20):
     Returns:
         Background color as BGR array
     """
-    h, w = img_bgr.shape[:2]
-    cx = max(int(w * corner_pct), 5)
-    cy = max(int(h * corner_pct), 5)
+    # Use border-based approach for better robustness
+    return get_bg_color_from_border(img_bgr, border_pct=corner_pct)
 
-    corners = [
-        img_bgr[0:cy, 0:cx],           # top-left
-        img_bgr[0:cy, w-cx:w],         # top-right
-        img_bgr[h-cy:h, 0:cx],         # bottom-left
-        img_bgr[h-cy:h, w-cx:w],       # bottom-right
-    ]
 
-    # Stack all corner pixels together
-    all_corner_pixels = np.vstack([c.reshape(-1, 3) for c in corners])
-    return get_dominant_color_simple(all_corner_pixels, k=2)
+def get_saturation(bgr_color):
+    """
+    Get HSV saturation of a color (0-1).
+    Saturated colors are intentional, not gray artifacts.
+    
+    Args:
+        bgr_color: BGR color as array or tuple
+        
+    Returns:
+        Saturation value (0-1)
+    """
+    pixel = np.uint8([[bgr_color]])
+    hsv = cv2.cvtColor(pixel, cv2.COLOR_BGR2HSV)[0][0]
+    return hsv[1] / 255.0
+
+
+def get_brightness(bgr_color):
+    """
+    Perceived brightness of a color (0-255).
+    Uses standard luminance formula.
+    
+    Args:
+        bgr_color: BGR color as array or tuple
+        
+    Returns:
+        Brightness value (0-255)
+    """
+    b, g, r = bgr_color[0], bgr_color[1], bgr_color[2]
+    return 0.299 * r + 0.587 * g + 0.114 * b
+
+
+def merge_clusters(centers, counts, merge_threshold=25):
+    """
+    Merge color-similar clusters.
+    Prevents one color being split across multiple clusters.
+    
+    Args:
+        centers: Array of cluster centers (BGR colors)
+        counts: Array of pixel counts per cluster
+        merge_threshold: Maximum distance to merge clusters (default 25)
+        
+    Returns:
+        List of merged clusters, each with 'color' and 'count'
+    """
+    n = len(centers)
+    used = [False] * n
+    result = []
+
+    for i in range(n):
+        if used[i]:
+            continue
+        group_c = [centers[i]]
+        group_n = [counts[i]]
+
+        for j in range(i + 1, n):
+            if used[j]:
+                continue
+            if np.linalg.norm(centers[i].astype(float) - centers[j].astype(float)) < merge_threshold:
+                group_c.append(centers[j])
+                group_n.append(counts[j])
+                used[j] = True
+
+        total = sum(group_n)
+        merged = np.average(group_c, axis=0, weights=group_n).astype(np.int32)
+        result.append({"color": merged, "count": total})
+        used[i] = True
+
+    return result
+
+
+def score_cluster_generalized(cluster, bg_color, total_pixels):
+    """
+    Generalized scoring - no image-specific assumptions.
+    Combines 4 signals:
+      - Distance from bg (0.40) - higher = more likely text
+      - Pixel count (0.25) - higher = more likely text
+      - Saturation (0.20) - saturated colors are intentional
+      - Brightness contrast (0.15) - strong contrast vs bg
+    
+    Args:
+        cluster: Dict with 'color' (BGR array) and 'count' (pixel count)
+        bg_color: Background color as BGR array
+        total_pixels: Total number of pixels in image
+        
+    Returns:
+        Combined score (higher = more likely to be text)
+    """
+    color = cluster["color"].astype(np.float32)
+    count = cluster["count"]
+    bg_f = np.array(bg_color, dtype=np.float32)
+
+    # Signal 1: Distance from bg (normalized 0-1)
+    max_possible_distance = 441.0  # sqrt(3) * 255
+    dist = np.linalg.norm(color - bg_f)
+    dist_score = min(dist / max_possible_distance, 1.0)
+
+    # Signal 2: Pixel ratio (normalized 0-1)
+    pixel_score = count / total_pixels if total_pixels > 0 else 0.0
+
+    # Signal 3: Saturation (0-1)
+    sat = get_saturation(cluster["color"])
+
+    # Signal 4: Contrast extremity
+    # Is this color at the opposite end of brightness vs bg?
+    bg_bright = get_brightness(bg_color)
+    color_bright = get_brightness(cluster["color"])
+    brightness_diff = abs(bg_bright - color_bright) / 255.0
+
+    # Combine all signals
+    score = (
+        dist_score * 0.40 +        # far from bg
+        pixel_score * 0.25 +       # has enough pixels
+        sat * 0.20 +               # is a real intentional color
+        brightness_diff * 0.15     # strong contrast vs bg
+    )
+
+    return score
 
 
 def score_cluster(distance, pixel_count, total_pixels, distance_weight=0.7, pixel_weight=0.3):
     """
-    Combined score: reward distance + reward pixel presence.
-    Distance weighted higher because a tiny speck of pure text color should still beat
-    a large patch of near-background color.
-    
-    Args:
-        distance: Distance from background color
-        pixel_count: Number of pixels in this cluster
-        total_pixels: Total number of pixels in image
-        distance_weight: Weight for distance score (default 0.7)
-        pixel_weight: Weight for pixel count score (default 0.3)
-        
-    Returns:
-        Combined score (0-1 range)
+    Legacy scoring function for backward compatibility.
+    Use score_cluster_generalized for better results.
     """
-    # Normalize distance score (assuming max distance ~255*sqrt(3) ≈ 441)
-    max_possible_distance = 441.0  # sqrt(3) * 255
+    max_possible_distance = 441.0
     distance_score = min(distance / max_possible_distance, 1.0)
-    
-    # Normalize pixel count score
     pixel_score = pixel_count / total_pixels if total_pixels > 0 else 0.0
-    
-    # Combined score: distance weighted higher
     return (distance_score * distance_weight) + (pixel_score * pixel_weight)
 
 
-def get_text_color_from_clusters(img_bgr, bg_color, k=5, bg_threshold=40, min_pixel_ratio=0.02):
+def get_text_color_from_clusters(img_bgr, bg_color, k=8, bg_threshold=40, border_pct=0.15):
     """
-    After bg is known from corners, cluster all pixels → pick cluster with highest score.
-    Score combines: distance from bg (weighted 0.7) + pixel presence (weighted 0.3).
+    Simple rule: Most dominant color after excluding bg = text color.
+    No scoring needed - just pixel count ranking.
     
     Args:
         img_bgr: BGR image as numpy array
         bg_color: Background color as BGR array
-        k: Number of clusters for KMeans (default 5)
-        bg_threshold: Minimum distance from bg to consider as text cluster (default 40)
-        min_pixel_ratio: Minimum pixel ratio to consider (default 0.02 = 2%)
+        k: Number of clusters for KMeans (default 8)
+        bg_threshold: Minimum distance from bg to exclude cluster (default 40)
+        border_pct: Fraction for border sampling (unused, kept for compatibility)
         
     Returns:
         Text color as BGR array
@@ -445,72 +572,60 @@ def get_text_color_from_clusters(img_bgr, bg_color, k=5, bg_threshold=40, min_pi
         km = KMeans(n_clusters=k, n_init=5, random_state=0)
         km.fit(all_pixels)
 
-        centers = km.cluster_centers_          # all dominant colors
-        counts = np.bincount(km.labels_)      # how many pixels per cluster
+        centers = km.cluster_centers_.astype(np.int32)
+        counts = np.bincount(km.labels_)
 
-        # Calculate distance of each cluster from bg
-        distances = np.linalg.norm(centers - bg_f, axis=1)
+        # Merge similar clusters to prevent color splitting
+        clusters = merge_clusters(centers, counts, merge_threshold=25)
 
         # Log all clusters for debugging
-        logger.debug("All clusters:")
-        for i in range(k):
-            ratio = counts[i] / total_px if total_px > 0 else 0.0
+        logger.debug("All clusters (after merging):")
+        for i, c in enumerate(clusters):
+            dist = np.linalg.norm(c["color"].astype(float) - bg_f)
+            ratio = c["count"] / total_px if total_px > 0 else 0.0
             logger.debug(
-                f"  [{i}] Color: {centers[i].astype(int).tolist()}  "
-                f"Distance: {distances[i]:.1f}  "
-                f"Pixels: {counts[i]}  Ratio: {ratio:.2%}"
+                f"  [{i}] Color: {c['color'].tolist()}  "
+                f"Pixels: {c['count']}  Ratio: {ratio:.2%}  "
+                f"Dist from bg: {dist:.1f}"
             )
 
-        # Filter: must be far enough from bg AND have enough pixels
-        valid_clusters = [
-            i for i in range(k)
-            if distances[i] > bg_threshold  # far from bg
-            and (counts[i] / total_px) >= min_pixel_ratio  # has enough pixels
+        # Exclude bg-like clusters
+        non_bg = [
+            c for c in clusters
+            if np.linalg.norm(c["color"].astype(float) - bg_f) > bg_threshold
         ]
 
-        if not valid_clusters:
-            # Relax pixel filter if nothing found (but still require distance)
-            logger.warning("No clusters found with enough pixels, relaxing pixel filter")
-            valid_clusters = [
-                i for i in range(k)
-                if distances[i] > bg_threshold
+        # Fallback: lower threshold if nothing found
+        if not non_bg:
+            logger.warning("No clusters found far enough from bg, lowering threshold")
+            non_bg = [
+                c for c in clusters
+                if np.linalg.norm(c["color"].astype(float) - bg_f) > bg_threshold // 2
             ]
 
-        if not valid_clusters:
-            # Last resort: use farthest cluster anyway
-            logger.warning("No clusters far enough from bg, using farthest cluster")
-            sorted_by_distance = np.argsort(-distances)
-            text_color = centers[sorted_by_distance[0]].astype(np.uint8)
-            return text_color
+        if not non_bg:
+            logger.warning("Still no non-bg clusters found, using all clusters")
+            non_bg = clusters
 
-        # Score each valid cluster
-        scores = [
-            score_cluster(distances[i], counts[i], total_px)
-            for i in valid_clusters
-        ]
+        # Sort by pixel count (most dominant first)
+        non_bg.sort(key=lambda x: -x["count"])
 
-        # Pick cluster with highest score
-        best_idx_in_valid = np.argmax(scores)
-        best_idx = valid_clusters[best_idx_in_valid]
-        text_color = centers[best_idx].astype(np.uint8)
-
-        # Log scoring information for debugging
-        logger.debug("Scored clusters (distance × 0.7 + pixel_ratio × 0.3):")
-        scored_clusters = [
-            (valid_clusters[i], scores[i], distances[valid_clusters[i]], counts[valid_clusters[i]] / total_px)
-            for i in range(len(valid_clusters))
-        ]
-        scored_clusters.sort(key=lambda x: -x[1])  # sort by score descending
-        
-        for i, (idx, score, dist, ratio) in enumerate(scored_clusters[:3]):  # top 3
+        # Log non-bg clusters sorted by pixel count
+        logger.debug("Non-bg clusters sorted by pixel count:")
+        for i, c in enumerate(non_bg[:3]):  # top 3
+            dist = np.linalg.norm(c["color"].astype(float) - bg_f)
+            ratio = c["count"] / total_px if total_px > 0 else 0.0
             logger.debug(
-                f"  [{i}] Color: {centers[idx].astype(int).tolist()}  "
-                f"Score: {score:.3f}  "
-                f"Distance: {dist:.1f}  "
-                f"Pixel ratio: {ratio:.2%}"
+                f"  [{i}] Color: {c['color'].tolist()}  "
+                f"Pixels: {c['count']}  Ratio: {ratio:.2%}  "
+                f"Dist from bg: {dist:.1f}"
             )
 
-        return text_color
+        if len(non_bg) == 0:
+            return None
+
+        # Most dominant non-bg cluster = text color
+        return non_bg[0]["color"].astype(np.uint8)
         
     except Exception as e:
         logger.warning(f"Clustering failed: {e}, using fallback")
@@ -522,17 +637,16 @@ def get_text_color_from_clusters(img_bgr, bg_color, k=5, bg_threshold=40, min_pi
         return get_dominant_color_simple(far_pixels.astype(np.uint8), k=2)
 
 
-def get_all_text_colors_from_roi(roi_bgr, bg_color, k=5, bg_threshold=40, min_pixel_ratio=0.02):
+def get_all_text_colors_from_roi(roi_bgr, bg_color, k=8, bg_threshold=40):
     """
-    Detect all text colors (primary and secondary) from ROI using scoring approach.
-    Returns primary text color (highest score) and secondary text color (2nd highest score).
+    Detect all text colors (primary and secondary) from ROI.
+    Simple rule: Most dominant non-bg cluster = primary text, 2nd most = secondary.
     
     Args:
         roi_bgr: BGR image as numpy array
         bg_color: Background color as BGR array
-        k: Number of clusters for KMeans (default 5)
-        bg_threshold: Minimum distance from bg to consider as text cluster (default 40)
-        min_pixel_ratio: Minimum pixel ratio to consider (default 0.02 = 2%)
+        k: Number of clusters for KMeans (default 8)
+        bg_threshold: Minimum distance from bg to exclude cluster (default 40)
         
     Returns:
         Dict with 'primary_text' and 'secondary_text' (BGR arrays), or None if detection fails
@@ -548,46 +662,40 @@ def get_all_text_colors_from_roi(roi_bgr, bg_color, k=5, bg_threshold=40, min_pi
         km = KMeans(n_clusters=k, n_init=5, random_state=0)
         km.fit(all_pixels)
 
-        centers = km.cluster_centers_
+        centers = km.cluster_centers_.astype(np.int32)
         counts = np.bincount(km.labels_)
-        distances = np.linalg.norm(centers - bg_f, axis=1)
 
-        # Filter: must be far enough from bg AND have enough pixels
-        valid_clusters = [
-            i for i in range(k)
-            if distances[i] > bg_threshold  # far from bg
-            and (counts[i] / total_px) >= min_pixel_ratio  # has enough pixels
+        # Merge similar clusters
+        clusters = merge_clusters(centers, counts, merge_threshold=25)
+
+        # Exclude bg-like clusters
+        non_bg = [
+            c for c in clusters
+            if np.linalg.norm(c["color"].astype(float) - bg_f) > bg_threshold
         ]
 
-        if not valid_clusters:
-            # Relax pixel filter if nothing found
-            valid_clusters = [
-                i for i in range(k)
-                if distances[i] > bg_threshold
+        # Fallback: lower threshold if nothing found
+        if not non_bg:
+            non_bg = [
+                c for c in clusters
+                if np.linalg.norm(c["color"].astype(float) - bg_f) > bg_threshold // 2
             ]
 
-        if len(valid_clusters) == 0:
+        if not non_bg:
+            non_bg = clusters
+
+        if len(non_bg) == 0:
             return None
 
-        # Score each valid cluster
-        scores = [
-            score_cluster(distances[i], counts[i], total_px)
-            for i in valid_clusters
-        ]
-
-        # Sort by score (highest first)
-        scored_clusters = [
-            (valid_clusters[i], scores[i], centers[valid_clusters[i]], distances[valid_clusters[i]], counts[valid_clusters[i]])
-            for i in range(len(valid_clusters))
-        ]
-        scored_clusters.sort(key=lambda x: -x[1])  # sort by score descending
+        # Sort by pixel count (most dominant first)
+        non_bg.sort(key=lambda x: -x["count"])
 
         result = {
-            "primary_text": scored_clusters[0][2].astype(np.uint8),
+            "primary_text": non_bg[0]["color"].astype(np.uint8),
         }
         
-        if len(scored_clusters) > 1:
-            result["secondary_text"] = scored_clusters[1][2].astype(np.uint8)
+        if len(non_bg) > 1:
+            result["secondary_text"] = non_bg[1]["color"].astype(np.uint8)
 
         return result
         
@@ -596,19 +704,17 @@ def get_all_text_colors_from_roi(roi_bgr, bg_color, k=5, bg_threshold=40, min_pi
         return None
 
 
-def get_text_and_bg_colors_from_roi(roi_bgr, corner_pct=0.20, k_clusters=5, bg_threshold=40, min_pixel_ratio=0.02):
+def get_text_and_bg_colors_from_roi(roi_bgr, border_pct=0.15, k_clusters=8, bg_threshold=40):
     """
-    Extract both text color and background color from ROI region using corner-based approach.
-    Corners are always background, text color = cluster with highest score.
-    Score combines: distance from bg (weighted 0.7) + pixel presence (weighted 0.3).
-    No edge detection needed - works for bold, thin, colored, low-contrast text equally.
+    Extract both text color and background color from ROI region using simple approach.
+    Rule: Corners/border = bg, most dominant non-bg cluster = text color.
+    No scoring needed - just pixel count ranking after excluding bg.
     
     Args:
         roi_bgr: BGR image region as numpy array
-        corner_pct: Fraction of image to use as corner bg sample (default 20%)
-        k_clusters: Number of clusters for KMeans (default 5)
-        bg_threshold: Minimum distance from bg to consider as text cluster (default 40)
-        min_pixel_ratio: Minimum pixel ratio to consider (default 0.02 = 2%)
+        border_pct: Fraction of image to use as border bg sample (default 15%)
+        k_clusters: Number of clusters for KMeans (default 8)
+        bg_threshold: Minimum distance from bg to exclude cluster (default 40)
         
     Returns:
         Tuple of (text_color_bgr, bg_color_bgr) as BGR tuples, or None if detection fails
@@ -623,24 +729,23 @@ def get_text_and_bg_colors_from_roi(roi_bgr, corner_pct=0.20, k_clusters=5, bg_t
 
     # For very small images, adjust parameters
     if h < 30 or w < 30:
-        corner_pct = 0.15
+        border_pct = 0.10
         k_clusters = 3
         bg_threshold = 30
-        min_pixel_ratio = 0.01  # Lower threshold for small images
 
     try:
-        # Step 1: Background from corners (corners are always background)
-        bg_color = get_bg_color_from_corners(roi_bgr, corner_pct)
+        # Step 1: Background from border strips
+        bg_color = get_bg_color_from_border(roi_bgr, border_pct)
         
         if bg_color is None:
             return _fallback_color_detection(roi_bgr)
         
-        # Step 2: Text color = cluster with highest score (distance × 0.7 + pixel_ratio × 0.3)
+        # Step 2: Text color = most dominant non-bg cluster
         text_color = get_text_color_from_clusters(
             roi_bgr, bg_color, 
             k=k_clusters, 
             bg_threshold=bg_threshold,
-            min_pixel_ratio=min_pixel_ratio
+            border_pct=border_pct
         )
         
         if text_color is None:

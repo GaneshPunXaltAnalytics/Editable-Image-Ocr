@@ -59,3 +59,47 @@ acceptance_criteria:
   - Masking correctly isolates bounding box regions.
   - Inpainting removes text from the masked areas.
   - API returns JSON with inpainted image, detected text, and font color.
+
+ResponseFormat:
+  final: "iVBORw0KGgoAAAANSUhEUgAA..."
+  mask: "iVBORw0KGgoAAAANSUhEUgAA..."
+  inpainting_method: "lama"
+  image_width: 1920
+  image_height: 1080
+
+  text_regions:
+    - text: "TRANSFORM YOUR POTENTIAL"
+      polygon:
+        - x: 100
+          y: 100
+        - x: 400
+          y: 100
+        - x: 400
+          y: 200
+        - x: 100
+          y: 200
+      score: 0.9523
+      color: "#000000"
+      color_bgr: [0, 0, 0]
+      background_color: "#fefefe"
+      background_color_bgr: [254, 254, 254]
+
+    - text: "SAGE UNIVERSITY"
+      polygon:
+        - x: 100
+          y: 100
+        - x: 400
+          y: 100
+        - x: 400
+          y: 200
+        - x: 100
+          y: 200
+      score: 0.8876
+      color: "#000000"
+      color_bgr: [0, 0, 0]
+      background_color: "#fefefe"
+      background_color_bgr: [254, 254, 254]
+
+  paths:
+    final: "D:\\...\\saved_outputs\\20240227\\final_a1b2c3d4.png"
+    mask: "D:\\...\\saved_outputs\\20240227\\mask_a1b2c3d4.png"

@@ -6,4 +6,5 @@ numpy==1.26.4
 paddleocr
 paddlepaddle
 python-dotenv==1.0.0
+scikit-learn
 

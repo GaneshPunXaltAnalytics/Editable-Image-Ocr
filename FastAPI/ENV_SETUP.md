@@ -57,6 +57,12 @@ This API uses environment variables for configuration. Copy `env.example` to `.e
 - **Default**: Auto-detected from `__file__`
 - **Example**: `PROJECT_ROOT=/custom/path/to/project`
 
+### `OCR_MAX_WORKERS` (Optional)
+- **Description**: Maximum number of parallel workers for OCR text extraction
+- **Default**: Auto-detected (min of 32, number of polygons + 4, or CPU count * 2)
+- **Example**: `OCR_MAX_WORKERS=8`
+- **Note**: Set to `1` to disable parallel processing (sequential processing)
+
 ## Notes
 
 - The `.env` file is automatically loaded when the application starts

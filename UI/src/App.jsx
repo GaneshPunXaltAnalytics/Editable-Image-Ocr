@@ -145,9 +145,10 @@ export default function App() {
   const [compositeTextRegions, setCompositeTextRegions] = useState([]); // in full image coords, set when Apply to Original
   const [compositeImageSize, setCompositeImageSize] = useState(null); // full composite dimensions
   const [compositeDisplaySize, setCompositeDisplaySize] = useState(null); // displayed size of composite img
-  const [polygonMode, setPolygonMode] = useState(false);
+  const [polygonMode, setPolygonMode] = useState(true); // Default to polygon mode
   const [polygonPoints, setPolygonPoints] = useState([]); // array of {dx,dy,nx,ny}
   const [polygons, setPolygons] = useState([]); // saved polygons (multiple)
+  const [polygonColors, setPolygonColors] = useState({}); // { polygonId: { color, background_color } }
   const CLOSE_POLYGON_THRESHOLD_PX = 18; // click within this many px of first point to close polygon
   const [maskDataUrl, setMaskDataUrl] = useState(null);
   const [selected, setSelected] = useState(null); // url
@@ -283,6 +284,27 @@ export default function App() {
       window.removeEventListener("mouseup", onUp);
     };
   }, [compositeImageSize, compositeDisplaySize]);
+
+  // Undo functionality: Ctrl+Z removes last polygon point
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      // Check for Ctrl+Z (or Cmd+Z on Mac)
+      if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey && !e.altKey) {
+        // Prevent default browser undo behavior
+        e.preventDefault();
+        
+        // Only undo if we're in polygon mode and have points
+        if (polygonMode && polygonPoints.length > 0) {
+          setPolygonPoints(prev => prev.slice(0, -1));
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [polygonMode, polygonPoints.length]);
 
   function handleFiles(e) {
     const files = Array.from(e.target.files || []);
@@ -703,7 +725,8 @@ export default function App() {
         for (const line of coloredLines) {
           let x = minX;
           for (const seg of line) {
-            ctx.fillStyle = seg.color || defaultColor;
+            // Use detected text color if available, otherwise use HTML color or default
+            ctx.fillStyle = region.color || seg.color || defaultColor;
 
             // Logic: 
             // 1. If the segment has a specific font (e.g. from ql-font- class), use it.
@@ -725,7 +748,8 @@ export default function App() {
           y += lineHeight;
         }
       } else {
-        ctx.fillStyle = defaultColor;
+        // Use detected text color if available
+        ctx.fillStyle = region.color || defaultColor;
         ctx.font = toCanvasFont(fontSize, regionFontFamily);
         ctx.fillText(region.text || "", minX, minY);
       }
@@ -790,6 +814,37 @@ export default function App() {
     setPolygonPoints([]);
     setFinalImage(null);
     setMaskDataUrl(null);
+  }
+
+  // Fetch color for a single polygon when it's closed
+  async function fetchPolygonColor(polygonId, points) {
+    if (!selectedFile || !points || points.length < 3) return;
+    try {
+      const polygonForServer = points.map(p => ({ x: Math.round(p.nx), y: Math.round(p.ny) }));
+      const form = new FormData();
+      form.append("file", selectedFile, selectedFile.name || "original.png");
+      form.append("polygons", JSON.stringify([polygonForServer]));
+      const res = await fetch("http://127.0.0.1:8000/process_roi", {
+        method: "POST",
+        body: form
+      });
+      if (!res.ok) return;
+      const json = await res.json().catch(() => null);
+      if (json && json.text_regions && json.text_regions.length > 0) {
+        const region = json.text_regions[0];
+        if (region.color) {
+          setPolygonColors(prev => ({
+            ...prev,
+            [polygonId]: {
+              color: region.color,
+              background_color: region.background_color,
+            }
+          }));
+        }
+      }
+    } catch (err) {
+      console.error("Failed to fetch polygon color:", err);
+    }
   }
 
   function cropSelection() {
@@ -951,7 +1006,10 @@ export default function App() {
                       const nearFirst = first && prev.length >= 3 &&
                         Math.hypot(dx - first.dx, dy - first.dy) <= CLOSE_POLYGON_THRESHOLD_PX;
                       if (nearFirst) {
-                        setPolygons(ps => [...ps, { id: cryptoRandomId(), points: prev }]);
+                        const newPolyId = cryptoRandomId();
+                        setPolygons(ps => [...ps, { id: newPolyId, points: prev }]);
+                        // Fetch color for the new polygon
+                        fetchPolygonColor(newPolyId, prev);
                         return [];
                       }
                       return [...prev, { dx, dy, nx, ny }];
@@ -960,27 +1018,61 @@ export default function App() {
                 >
                   {/* existing saved polygons */}
                   <svg className="poly-svg" width="100%" height="100%" viewBox={`0 0 ${overlayRef.current ? overlayRef.current.clientWidth : 0} ${overlayRef.current ? overlayRef.current.clientHeight : 0}`} preserveAspectRatio="none">
-                    {polygons.map((poly, pi) => (
-                      <g key={poly.id}>
-                        <polyline
-                          points={poly.points.map(p => `${p.dx},${p.dy}`).concat(`${poly.points[0].dx},${poly.points[0].dy}`).join(" ")}
-                          fill="none"
-                          stroke="rgba(16,185,129,0.6)"
-                          strokeWidth="2"
-                        />
-                      </g>
-                    ))}
+                    {polygons.map((poly, pi) => {
+                      const polyColor = polygonColors[poly.id];
+                      // Calculate center point for color indicator
+                      const centerX = poly.points.reduce((sum, p) => sum + p.dx, 0) / poly.points.length;
+                      const centerY = poly.points.reduce((sum, p) => sum + p.dy, 0) / poly.points.length;
+                      return (
+                        <g key={poly.id}>
+                          <polyline
+                            points={poly.points.map(p => `${p.dx},${p.dy}`).concat(`${poly.points[0].dx},${poly.points[0].dy}`).join(" ")}
+                            fill="none"
+                            stroke="rgba(16,185,129,0.6)"
+                            strokeWidth="2"
+                          />
+                          {/* Color point indicator - show by default if color is available */}
+                          {polyColor && polyColor.color && (
+                            <circle
+                              cx={centerX}
+                              cy={centerY}
+                              r="8"
+                              fill={polyColor.color}
+                              stroke="#fff"
+                              strokeWidth="2"
+                              style={{ cursor: "pointer" }}
+                              title={`Text color: ${polyColor.color}`}
+                            />
+                          )}
+                        </g>
+                      );
+                    })}
                     {/* currently drawing polygon: show segment to first point when 3+ points (click there to close) */}
                     {polygonPoints.length > 0 && (
-                      <polyline
-                        points={polygonPoints.length >= 3
-                          ? polygonPoints.map(p => `${p.dx},${p.dy}`).concat(`${polygonPoints[0].dx},${polygonPoints[0].dy}`).join(" ")
-                          : polygonPoints.map(p => `${p.dx},${p.dy}`).join(" ")}
-                        fill="none"
-                        stroke="rgba(37,99,235,0.6)"
-                        strokeWidth="2"
-                        strokeDasharray="6,4"
-                      />
+                      <>
+                        <polyline
+                          points={polygonPoints.length >= 3
+                            ? polygonPoints.map(p => `${p.dx},${p.dy}`).concat(`${polygonPoints[0].dx},${polygonPoints[0].dy}`).join(" ")
+                            : polygonPoints.map(p => `${p.dx},${p.dy}`).join(" ")}
+                          fill="none"
+                          stroke="rgba(37,99,235,0.6)"
+                          strokeWidth="2"
+                          strokeDasharray="6,4"
+                        />
+                        {/* Show color point on first click */}
+                        {polygonPoints.length >= 1 && (
+                          <circle
+                            cx={polygonPoints[0].dx}
+                            cy={polygonPoints[0].dy}
+                            r="6"
+                            fill="rgba(37,99,235,0.8)"
+                            stroke="#fff"
+                            strokeWidth="1.5"
+                            style={{ cursor: "pointer" }}
+                            title="First point - color will be detected when polygon is closed"
+                          />
+                        )}
+                      </>
                     )}
                   </svg>
                 </div>
@@ -990,12 +1082,6 @@ export default function App() {
             )}
           </div>
           <div className="controls">
-            <button onClick={cropSelection} disabled={processing || polygonMode}>
-              {processing ? "Processing..." : "Crop Selection"}
-            </button>
-            <button onClick={clearSelection} disabled={processing}>
-              Clear Selection
-            </button>
             <button
               onClick={() => {
                 setPolygonMode(p => !p);
@@ -1004,82 +1090,6 @@ export default function App() {
               style={{ background: polygonMode ? "#1d4ed8" : undefined }}
             >
               {polygonMode ? "Polygon: ON" : "Polygon: OFF"}
-            </button>
-            <button
-              onClick={async () => {
-                // rectified crop requires exactly 4 points (quad)
-                let sourcePoly = null;
-                if (polygonPoints.length === 4) {
-                  sourcePoly = polygonPoints;
-                } else if (polygons.length > 0) {
-                  const last = polygons[polygons.length - 1].points;
-                  if (last.length === 4) sourcePoly = last;
-                }
-                if (!sourcePoly || sourcePoly.length !== 4) {
-                  alert("Rectified crop requires exactly 4 points. Draw a 4-point polygon and close it (click near the first point), or use a saved 4-point polygon.");
-                  return;
-                }
-                try {
-                  setProcessing(true);
-                  const quad = sourcePoly.map(p => ({ x: p.nx, y: p.ny }));
-                  const { dataUrl, width, height, orderedQuad } = await createRectifiedCrop(quad);
-                  setCropped(prev => [...prev, dataUrl]);
-                  setLastCrop({ polygon: orderedQuad, nWidth: width, nHeight: height, dataUrl });
-
-                  // send to backend
-                  function dataURLToBlob(dataURL) {
-                    const parts = dataURL.split(',');
-                    const meta = parts[0].match(/:(.*?);/);
-                    const contentType = meta ? meta[1] : 'image/png';
-                    const byteString = atob(parts[1]);
-                    const ia = new Uint8Array(byteString.length);
-                    for (let i = 0; i < byteString.length; i++) ia[i] = byteString.charCodeAt(i);
-                    return new Blob([ia], { type: contentType });
-                  }
-                  const blob = dataURLToBlob(dataUrl);
-                  const form = new FormData();
-                  form.append("file", blob, "crop.png");
-                  const res = await fetch("http://127.0.0.1:8000/process", {
-                    method: "POST",
-                    body: form
-                  });
-                  if (!res.ok) {
-                    const text = await res.text();
-                    throw new Error(`Server error ${res.status}: ${text}`);
-                  }
-                  const json = await res.json().catch(() => null);
-                  if (json) {
-                    const result = {
-                      annotated: json.annotated ? "data:image/png;base64," + json.annotated : null,
-                      mask: json.mask ? "data:image/png;base64," + json.mask : null,
-                      erased: json.erased ? "data:image/png;base64," + json.erased : null,
-                      original: json.original ? "data:image/png;base64," + json.original : null,
-                    };
-                    setProcessed(result);
-                    setPolygonMode(false);
-                    const regions = (json.text_regions || []).map((r) => ({
-                      id: cryptoRandomId(),
-                      text: r.text != null ? String(r.text) : "",
-                      score: r.score != null ? Number(r.score) : 1,
-                      box: Array.isArray(r.box) ? r.box.map((p) => [Number(p[0]), Number(p[1])]) : [[0, 0], [0, 0], [0, 0], [0, 0]],
-                    }));
-                    setCropTextRegions(regions);
-                    if (json.crop_width != null && json.crop_height != null) {
-                      setCropSize({ width: json.crop_width, height: json.crop_height });
-                    }
-                  } else {
-                    alert("Invalid response from server.");
-                  }
-                } catch (err) {
-                  console.error("Polygon crop failed", err);
-                  alert("Polygon crop failed: " + err.message);
-                } finally {
-                  setProcessing(false);
-                }
-              }}
-              disabled={processing}
-            >
-              Crop Polygon
             </button>
             <button
               onClick={() => {
@@ -1144,13 +1154,48 @@ export default function App() {
                     setFullFinalImageSize({ width: json.image_width, height: json.image_height });
                   }
                   // Parse text regions from OCR if available
-                  const regions = (json.text_regions || []).map((r) => ({
-                    id: cryptoRandomId(),
-                    text: r.text != null ? String(r.text) : "",
-                    score: r.score != null ? Number(r.score) : 1,
-                    box: Array.isArray(r.box) ? r.box.map((p) => [Number(p[0]), Number(p[1])]) : [[0, 0], [0, 0], [0, 0], [0, 0]],
-                  }));
+                  const regions = (json.text_regions || []).map((r) => {
+                    // Calculate bounding box from polygon coordinates for positioning
+                    let box = [[0, 0], [0, 0], [0, 0], [0, 0]];
+                    if (Array.isArray(r.polygon) && r.polygon.length > 0) {
+                      const xs = r.polygon.map(p => Number(p.x || (Array.isArray(p) ? p[0] : 0)));
+                      const ys = r.polygon.map(p => Number(p.y || (Array.isArray(p) ? p[1] : 0)));
+                      const minX = Math.min(...xs);
+                      const minY = Math.min(...ys);
+                      const maxX = Math.max(...xs);
+                      const maxY = Math.max(...ys);
+                      box = [[minX, minY], [maxX, minY], [maxX, maxY], [minX, maxY]];
+                    }
+                    return {
+                      id: cryptoRandomId(),
+                      text: r.text != null ? String(r.text) : "",
+                      score: r.score != null ? Number(r.score) : 1,
+                      polygon: Array.isArray(r.polygon) ? r.polygon : [],
+                      box: box,
+                      color: r.color || null,
+                      color_bgr: r.color_bgr || null,
+                      background_color: r.background_color || null,
+                      background_color_bgr: r.background_color_bgr || null,
+                    };
+                  });
                   setTextRegions(regions);
+                  
+                  // Store polygon colors from response
+                  if (json.text_regions && json.text_regions.length > 0) {
+                    const colorsMap = {};
+                    json.text_regions.forEach((r, idx) => {
+                      // Match polygon by comparing coordinates
+                      polygons.forEach((poly, polyIdx) => {
+                        if (polyIdx === idx && r.color) {
+                          colorsMap[poly.id] = {
+                            color: r.color,
+                            background_color: r.background_color,
+                          };
+                        }
+                      });
+                    });
+                    setPolygonColors(prev => ({ ...prev, ...colorsMap }));
+                  }
                   // Update processed mask if present
                   if (json.mask) setProcessed(prev => ({ ...prev, mask: "data:image/png;base64," + json.mask }));
                 } catch (err) {
@@ -1472,13 +1517,20 @@ export default function App() {
                                 fontSize: "inherit",
                                 lineHeight: 1.2,
                                 cursor: "text",
+                                color: region.color || undefined, // Use detected text color
                               }}
-                              title="Click to edit in toolbar below"
+                              title={`Click to edit | Text color: ${region.color || 'default'}`}
                             >
                               {useHtmlForDisplay(region.html, region.text) ? (
-                                <div className="text-region-html" dangerouslySetInnerHTML={{ __html: region.html }} />
+                                <div 
+                                  className="text-region-html" 
+                                  dangerouslySetInnerHTML={{ __html: region.html }}
+                                  style={{ color: region.color || undefined }}
+                                />
                               ) : (
-                                (region.text || " ")
+                                <span style={{ color: region.color || undefined }}>
+                                  {region.text || " "}
+                                </span>
                               )}
                             </div>
                           </div>
@@ -1643,13 +1695,20 @@ export default function App() {
                           fontSize: "inherit",
                           lineHeight: 1.2,
                           cursor: "text",
+                          color: region.color || undefined, // Use detected text color
                         }}
-                        title="Click to edit in toolbar below"
+                        title={`Click to edit | Text color: ${region.color || 'default'}`}
                       >
                         {useHtmlForDisplay(region.html, region.text) ? (
-                          <div className="text-region-html" dangerouslySetInnerHTML={{ __html: region.html }} />
+                          <div 
+                            className="text-region-html" 
+                            dangerouslySetInnerHTML={{ __html: region.html }}
+                            style={{ color: region.color || undefined }}
+                          />
                         ) : (
-                          (region.text || " ")
+                          <span style={{ color: region.color || undefined }}>
+                            {region.text || " "}
+                          </span>
                         )}
                       </div>
                     </div>

@@ -17,6 +17,7 @@ import io
 import logging
 import os
 import sys
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,7 @@ from PIL import Image
 load_dotenv()
 
 from helper import (
+    bgr_to_hex,
     build_mask_from_polygons,
     extract_text_from_polygons,
     inpaint,
@@ -181,8 +183,12 @@ async def process_with_roi(
     - **image_width / image_height**: dimensions of the original image
     - **text_regions**: array of extracted text regions, each containing:
       - **text**: extracted text string
-      - **box**: bounding box coordinates [[x1,y1], [x2,y2], [x3,y3], [x4,y4]] in image coordinates
+      - **polygon**: original polygon coordinates as array of {"x": number, "y": number} objects
       - **score**: OCR confidence score (0-1)
+      - **color**: detected text color as hex string (e.g., "#000000") or None
+      - **color_bgr**: detected text color as BGR tuple [b, g, r] or None
+      - **background_color**: detected background color as hex string (e.g., "#ffffff") or None
+      - **background_color_bgr**: detected background color as BGR tuple [b, g, r] or None
     - **paths**: server-side paths where outputs were persisted (for debugging)
     """
     if file.content_type.split("/")[0] != "image":
@@ -205,26 +211,134 @@ async def process_with_roi(
     img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
     h_orig, w_orig = img_bgr.shape[:2]
 
+    # Note: Global background detection removed - using polygon-specific detection only
+
     # Build mask
     mask_full = build_mask_from_polygons(h_orig, w_orig, polygons_list)
     logger.info("Mask built from %d polygon(s) for a %dx%d image.", len(polygons_list), w_orig, h_orig)
 
-    # Extract text from polygons using OCR
+    # Extract text from polygons using OCR (in parallel with async)
     text_regions = []
+    polygon_colors = []  # Store color for each polygon bounding box
     if _ocr_model is not None:
         try:
-            text_regions = extract_text_from_polygons(
+            start_time = time.time()
+            text_regions = await extract_text_from_polygons(
                 img_rgb=img_rgb,
                 polygons=polygons_list,
                 ocr_model=_ocr_model,
             )
-            logger.info("Extracted %d text region(s) from polygons.", len(text_regions))
+            elapsed_time = time.time() - start_time
+            logger.info(
+                "Extracted %d text region(s) from %d polygon(s) in %.2f seconds.",
+                len(text_regions),
+                len(polygons_list),
+                elapsed_time,
+            )
         except Exception as exc:
             logger.warning("OCR text extraction failed: %s", exc, exc_info=True)
     else:
         logger.warning("OCR model not available — skipping text extraction.")
 
+    # Detect color for each polygon bounding box (must be done after OCR to match colors with text)
+    from helper import get_text_and_bg_colors_from_roi
+    print(f"\n[Color Detection] Detecting text and background colors for {len(polygons_list)} polygon(s)...")
+    for poly_idx, polygon in enumerate(polygons_list):
+        try:
+            xs = [p[0] for p in polygon]
+            ys = [p[1] for p in polygon]
+            min_x = max(0, int(min(xs)))
+            min_y = max(0, int(min(ys)))
+            max_x = min(w_orig - 1, int(max(xs)))
+            max_y = min(h_orig - 1, int(max(ys)))
+            
+            if max_x > min_x and max_y > min_y:
+                # Extract polygon region
+                poly_roi_bgr = img_bgr[min_y:max_y + 1, min_x:max_x + 1]
+                colors_result = get_text_and_bg_colors_from_roi(poly_roi_bgr)
+                
+                if colors_result is not None:
+                    poly_text_bgr, poly_bg_bgr = colors_result
+                    poly_text_hex = bgr_to_hex(poly_text_bgr)
+                    poly_bg_hex = bgr_to_hex(poly_bg_bgr)
+                    polygon_colors.append({
+                        "polygon_index": poly_idx,
+                        "polygon": polygon,
+                        "color": poly_text_hex,
+                        "color_bgr": poly_text_bgr.tolist(),
+                        "background_color": poly_bg_hex,
+                        "background_color_bgr": poly_bg_bgr.tolist(),
+                    })
+                    print(f"[Polygon {poly_idx}] Detected text color: {poly_text_hex} | Background color: {poly_bg_hex}")
+                else:
+                    polygon_colors.append({
+                        "polygon_index": poly_idx,
+                        "polygon": polygon,
+                        "color": None,
+                        "color_bgr": None,
+                        "background_color": None,
+                        "background_color_bgr": None,
+                    })
+                    print(f"[Polygon {poly_idx}] Color detection failed")
+            else:
+                polygon_colors.append({
+                    "polygon_index": poly_idx,
+                    "polygon": polygon,
+                    "color": None,
+                    "color_bgr": None,
+                    "background_color": None,
+                    "background_color_bgr": None,
+                })
+                print(f"[Polygon {poly_idx}] Invalid bounding box, skipping color detection")
+        except Exception as exc:
+            logger.warning(f"Color detection failed for polygon {poly_idx}: {exc}")
+            polygon_colors.append({
+                "polygon_index": poly_idx,
+                "polygon": polygon,
+                "color": None,
+                "color_bgr": None,
+                "background_color": None,
+                "background_color_bgr": None,
+            })
+
+    # Add polygon coordinates and colors to each text region
+    for region in text_regions:
+        poly_idx = region.get('polygon_index', -1)
+        if poly_idx >= 0 and poly_idx < len(polygons_list):
+            # Add polygon coordinates
+            region['polygon'] = [{"x": float(p[0]), "y": float(p[1])} for p in polygons_list[poly_idx]]
+            
+            # Add color information from polygon_colors
+            if poly_idx < len(polygon_colors):
+                poly_color_data = polygon_colors[poly_idx]
+                region['color'] = poly_color_data.get('color')
+                region['color_bgr'] = poly_color_data.get('color_bgr')
+                region['background_color'] = poly_color_data.get('background_color')
+                region['background_color_bgr'] = poly_color_data.get('background_color_bgr')
+            else:
+                region['color'] = None
+                region['color_bgr'] = None
+                region['background_color'] = None
+                region['background_color_bgr'] = None
+        
+        # Remove polygon_index as it's no longer needed in response
+        region.pop('polygon_index', None)
+    
+    # Print all extracted text regions with their detected colors
+    if text_regions:
+        print(f"\n[OCR Summary] Total text regions extracted: {len(text_regions)}")
+        for idx, region in enumerate(text_regions, 1):
+            color_info = ""
+            if region.get('color'):
+                color_info = f" | Text Color: {region['color']} | BG Color: {region.get('background_color', 'N/A')}"
+            else:
+                color_info = " | Color: Not detected"
+            print(f"  [{idx}] Text: '{region['text']}' | Score: {region['score']:.4f}{color_info}")
+    else:
+        print("[OCR Summary] No text regions extracted from polygons.")
+
     # Inpaint
+    inpainting_start_time = time.time()
     inpainted_bgr, inpainting_method = inpaint(
         img_bgr,
         mask_full,
@@ -232,14 +346,15 @@ async def process_with_roi(
         lama_model_path=LAMA_MODEL_PATH,
         device=DEVICE,
     )
-    logger.info("Inpainting complete using method: %s", inpainting_method)
+    inpainting_elapsed_time = time.time() - inpainting_start_time
+    logger.info("Inpainting complete using method: %s in %.2f seconds", inpainting_method, inpainting_elapsed_time)
+    print(f"[Inpainting] Method: {inpainting_method} | Time taken: {inpainting_elapsed_time:.2f} seconds")
 
     # Prepare response images
     final_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
     mask_rgb = cv2.cvtColor(mask_full, cv2.COLOR_GRAY2RGB)
 
     final_path, saved_mask_path = save_outputs_to_disk(final_rgb, mask_rgb, OUTPUTS_ROOT)
-
     return JSONResponse({
         "final": np_to_b64_png(final_rgb),
         "mask": np_to_b64_png(mask_rgb),

@@ -71,6 +71,18 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 API_TITLE = os.getenv("API_TITLE", "Image Inpainting API")
 DEVICE = os.getenv("DEVICE", "cpu")
 
+# OCRFlux configuration
+OCRFLUX_MODEL_PATH_STR = os.getenv("OCRFLUX_MODEL_PATH", "./models/OCRFlux-3B")
+OCRFLUX_MODEL_PATH = (
+    Path(OCRFLUX_MODEL_PATH_STR) if Path(OCRFLUX_MODEL_PATH_STR).is_absolute()
+    else PROJECT_ROOT / OCRFLUX_MODEL_PATH_STR
+)
+OCRFLUX_GPU_UTIL = float(os.getenv("OCRFLUX_GPU_UTIL", "0.8"))
+OCRFLUX_MAX_MODEL_LEN = int(os.getenv("OCRFLUX_MAX_MODEL_LEN", "8192"))
+# OCRFlux processing mode: "per_polygon" (default, processes each cropped region) 
+# or "full_image" (processes full image once, then extracts text per polygon)
+OCRFLUX_MODE = os.getenv("OCRFLUX_MODE", "per_polygon").lower()
+
 # ---------------------------------------------------------------------------
 # Logging — use structured logging; replace with your log aggregator adapter
 # ---------------------------------------------------------------------------
@@ -84,7 +96,7 @@ logger = logging.getLogger("text_removal_api")
 # Module-level singletons — populated during lifespan startup
 # ---------------------------------------------------------------------------
 _lama_inpaint_fn: Any = None       # callable or None if LaMa unavailable
-_ocr_model: Any = None              # PaddleOCR model instance
+_ocr_model: Any = None              # OCRFlux LLM model instance
 
 
 def _load_lama_inpaint_fn():
@@ -107,17 +119,32 @@ def _load_lama_inpaint_fn():
 
 def _load_ocr_model():
     """
-    Initialize PaddleOCR model once at startup.
-    Returns the OCR model instance or None if unavailable.
+    Initialize OCRFlux model once at startup.
+    Returns the OCRFlux LLM model instance or None if unavailable.
     """
     try:
-        from paddleocr import PaddleOCR
-        ocr = PaddleOCR(use_angle_cls=True, lang='en', det_db_unclip_ratio=2.0, use_gpu=False)
-        logger.info("PaddleOCR model loaded successfully.")
-        return ocr
+        from vllm import LLM
+        
+        if not OCRFLUX_MODEL_PATH.exists():
+            logger.warning(
+                "OCRFlux model directory not found at %s — OCR text extraction unavailable.",
+                OCRFLUX_MODEL_PATH,
+            )
+            return None
+        
+        logger.info("Loading OCRFlux model from %s...", OCRFLUX_MODEL_PATH)
+        llm = LLM(
+            model=str(OCRFLUX_MODEL_PATH),
+            dtype='half',  # float16 — required for T4/V100 (compute < 8.0)
+            gpu_memory_utilization=OCRFLUX_GPU_UTIL,
+            max_model_len=OCRFLUX_MAX_MODEL_LEN,
+            trust_remote_code=True,
+        )
+        logger.info("OCRFlux model loaded successfully.")
+        return llm
     except Exception:
         logger.warning(
-            "Could not load PaddleOCR — OCR text extraction unavailable.",
+            "Could not load OCRFlux — OCR text extraction unavailable.",
             exc_info=True,
         )
         return None
@@ -227,6 +254,7 @@ async def process_with_roi(
                 img_rgb=img_rgb,
                 polygons=polygons_list,
                 ocr_model=_ocr_model,
+                ocr_mode=OCRFLUX_MODE,
             )
             elapsed_time = time.time() - start_time
             logger.info(
@@ -241,7 +269,6 @@ async def process_with_roi(
         logger.warning("OCR model not available — skipping text extraction.")
 
     # Detect color for each polygon bounding box (must be done after OCR to match colors with text)
-    from helper import get_text_and_bg_colors_from_roi
     print(f"\n[Color Detection] Detecting text and background colors for {len(polygons_list)} polygon(s)...")
     for poly_idx, polygon in enumerate(polygons_list):
         try:
@@ -374,5 +401,5 @@ def health():
     return JSONResponse({
         "status": "ok",
         "lama_available": _lama_inpaint_fn is not None and LAMA_MODEL_PATH.exists(),
-        "ocr_available": _ocr_model is not None,
+        "ocr_available": _ocr_model is not None and OCRFLUX_MODEL_PATH.exists(),
     })

@@ -9,9 +9,11 @@ import io
 import json
 import logging
 import os
+import re
 import asyncio
 from datetime import datetime
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Optional
 
 import cv2
@@ -811,19 +813,19 @@ def _extract_text_from_single_polygon(
     ocr_model,
 ) -> list[dict]:
     """
-    Extract text from a single polygon region using OCR.
+    Extract text from a single polygon region using OCRFlux.
 
     Args:
         img_rgb: RGB image as numpy array (H, W, 3)
         polygon: Polygon as a list of (x, y) tuples in image coordinates
         poly_idx: Index of the polygon (for logging)
-        ocr_model: PaddleOCR model instance
+        ocr_model: OCRFlux LLM model instance
 
     Returns:
         List of text regions found in this polygon, each containing:
         - text: extracted text string
-        - box: bounding box coordinates [[x1,y1], [x2,y2], [x3,y3], [x4,y4]] in image coordinates
-        - score: confidence score (0-1)
+        - score: confidence score (0-1, default 1.0 for OCRFlux)
+        - polygon_index: index of the polygon
     """
     text_regions = []
     h, w = img_rgb.shape[:2]
@@ -857,55 +859,54 @@ def _extract_text_from_single_polygon(
         crop_masked = crop_rgb.copy()
         crop_masked[crop_mask == 0] = [255, 255, 255]  # White background
 
-        # Run OCR on the cropped region
-        try:
-            ocr_results = ocr_model.ocr(crop_masked, cls=True)
-        except Exception as ocr_exc:
-            logger.warning(f"OCR failed for polygon {poly_idx}: {ocr_exc}")
-            return text_regions
-
-        # Flatten OCR results (handle different return formats)
-        flat_results = []
-        if ocr_results:
-            for page in ocr_results:
-                if page is None:
-                    continue
-                if isinstance(page, list):
-                    if page and isinstance(page[0], list):
-                        flat_results.extend(page)
-                    else:
-                        flat_results.append(page)
-
-        # Process OCR results and map coordinates back to original image
-        for ocr_item in flat_results:
-            if not ocr_item or len(ocr_item) < 2:
-                continue
-
+        # Convert to PIL Image and save to temporary file for OCRFlux
+        from ocrflux.inference import parse
+        
+        # Save cropped image to temporary file
+        with NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
+            tmp_path = tmp_file.name
             try:
-                ocr_box = ocr_item[0]  # [[x1,y1], [x2,y2], [x3,y3], [x4,y4]] in crop coordinates
-                ocr_info = ocr_item[1]
-
-                # Extract text and score
-                if isinstance(ocr_info, (list, tuple)) and len(ocr_info) >= 2:
-                    text = str(ocr_info[0]).strip()
-                    score = float(ocr_info[1])
-                else:
-                    text = str(ocr_info).strip()
-                    score = 1.0
-
-                if not text:
-                    continue
-
-                text_region = {
-                    "text": text,
-                    "score": round(score, 4),
-                    "polygon_index": poly_idx,  # Track which polygon this text came from
-                }
-                text_regions.append(text_region)
-
-            except Exception as e:
-                logger.warning(f"Error processing OCR result for polygon {poly_idx}: {e}")
-                continue
+                # Convert numpy array to PIL Image and save
+                crop_pil = Image.fromarray(crop_masked)
+                crop_pil.save(tmp_path, format='PNG')
+                
+                # Run OCRFlux on the cropped region
+                try:
+                    ocr_result = parse(ocr_model, tmp_path, max_page_retries=2)
+                    
+                    if ocr_result and 'document_text' in ocr_result:
+                        # Extract text from OCRFlux result
+                        # OCRFlux returns markdown text, extract plain text
+                        markdown_text = ocr_result['document_text'].strip()
+                        
+                        # Remove common markdown formatting for cleaner plain text
+                        # Keep basic text content but remove markdown syntax
+                        # Remove markdown headers, bold, italic, etc.
+                        text = re.sub(r'#+\s*', '', markdown_text)  # Remove headers
+                        text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)  # Remove bold
+                        text = re.sub(r'\*([^*]+)\*', r'\1', text)  # Remove italic
+                        text = re.sub(r'`([^`]+)`', r'\1', text)  # Remove code blocks
+                        text = text.strip()
+                        
+                        if text:
+                            text_region = {
+                                "text": text,
+                                "score": 1.0,  # OCRFlux doesn't provide confidence scores
+                                "polygon_index": poly_idx,
+                            }
+                            text_regions.append(text_region)
+                    else:
+                        logger.debug(f"No text found in polygon {poly_idx} by OCRFlux")
+                        
+                except Exception as ocr_exc:
+                    logger.warning(f"OCRFlux failed for polygon {poly_idx}: {ocr_exc}")
+                    
+            finally:
+                # Clean up temporary file
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
     except Exception as e:
         logger.warning(f"Error extracting text from polygon {poly_idx}: {e}", exc_info=True)
@@ -918,24 +919,30 @@ async def extract_text_from_polygons(
     polygons: list[list[tuple[float, float]]],
     ocr_model,
     max_workers: Optional[int] = None,
+    ocr_mode: str = "per_polygon",
 ) -> list[dict]:
     """
-    Extract text from polygon regions using OCR in parallel with async/await.
+    Extract text from polygon regions using OCRFlux in parallel with async/await.
 
     Args:
         img_rgb: RGB image as numpy array (H, W, 3)
         polygons: List of polygons, each polygon is a list of (x, y) tuples in image coordinates
-        ocr_model: PaddleOCR model instance
+        ocr_model: OCRFlux LLM model instance
         max_workers: Maximum number of parallel workers (default: from OCR_MAX_WORKERS env var or auto-detected)
+        ocr_mode: Processing mode - "per_polygon" (process each crop) or "full_image" (process full image once)
 
     Returns:
         List of text regions, each containing:
         - text: extracted text string
-        - box: bounding box coordinates [[x1,y1], [x2,y2], [x3,y3], [x4,y4]] in image coordinates
-        - score: confidence score (0-1)
+        - score: confidence score (0-1, default 1.0 for OCRFlux)
+        - polygon_index: index of the polygon
     """
     if not polygons:
         return []
+    
+    # If full_image mode, process full image once and extract text for each polygon
+    if ocr_mode == "full_image":
+        return await _extract_text_full_image_mode(img_rgb, polygons, ocr_model)
 
     # Determine max workers (for semaphore to limit concurrency)
     if max_workers is None:
@@ -994,6 +1001,82 @@ async def extract_text_from_polygons(
             logger.warning(f"Polygon {idx} OCR extraction generated an exception: {result}", exc_info=True)
         else:
             text_regions.extend(result)
+    
+    return text_regions
+
+
+async def _extract_text_full_image_mode(
+    img_rgb: np.ndarray,
+    polygons: list[list[tuple[float, float]]],
+    ocr_model,
+) -> list[dict]:
+    """
+    Extract text by running OCRFlux on full image once, then extracting text for each polygon.
+    This is more efficient but less accurate for matching specific text to polygons.
+    
+    Args:
+        img_rgb: RGB image as numpy array (H, W, 3)
+        polygons: List of polygons
+        ocr_model: OCRFlux LLM model instance
+        
+    Returns:
+        List of text regions
+    """
+    text_regions = []
+    h, w = img_rgb.shape[:2]
+    
+    try:
+        from ocrflux.inference import parse
+        
+        # Save full image to temporary file
+        with NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
+            tmp_path = tmp_file.name
+            try:
+                # Convert numpy array to PIL Image and save
+                full_pil = Image.fromarray(img_rgb)
+                full_pil.save(tmp_path, format='PNG')
+                
+                # Run OCRFlux on full image
+                logger.info("Running OCRFlux on full image (full_image mode)...")
+                ocr_result = parse(ocr_model, tmp_path, max_page_retries=2)
+                
+                if ocr_result and 'document_text' in ocr_result:
+                    # Extract text from OCRFlux result
+                    markdown_text = ocr_result['document_text'].strip()
+                    
+                    # Remove markdown formatting
+                    text = re.sub(r'#+\s*', '', markdown_text)
+                    text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
+                    text = re.sub(r'\*([^*]+)\*', r'\1', text)
+                    text = re.sub(r'`([^`]+)`', r'\1', text)
+                    text = text.strip()
+                    
+                    # Since OCRFlux doesn't provide bounding boxes, we assign
+                    # the extracted text to all polygons (or first polygon if multiple)
+                    # This is a limitation - we can't accurately match text to specific polygons
+                    if text:
+                        # Assign text to first polygon, or all if you prefer
+                        for poly_idx in range(len(polygons)):
+                            text_region = {
+                                "text": text,
+                                "score": 1.0,
+                                "polygon_index": poly_idx,
+                            }
+                            text_regions.append(text_region)
+                            # If you want text only for first polygon, break here
+                            # break
+                else:
+                    logger.debug("No text found in full image by OCRFlux")
+                    
+            finally:
+                # Clean up temporary file
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+                    
+    except Exception as e:
+        logger.warning(f"Full image OCR extraction failed: {e}", exc_info=True)
     
     return text_regions
 

@@ -3,8 +3,11 @@ uvicorn[standard]==0.22.0
 Pillow==10.0.0
 opencv-python-headless==4.7.0.72
 numpy==1.26.4
-paddleocr
-paddlepaddle
 python-dotenv==1.0.0
 scikit-learn
+# OCRFlux dependencies
+vllm
+git+https://github.com/chatdoc-com/OCRFlux.git
+transformers
+accelerate
 

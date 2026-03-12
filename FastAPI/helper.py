@@ -90,6 +90,84 @@ def inpaint(
     return opencv_inpaint(img_bgr, mask), "opencv"
 
 
+def save_debug_images(
+    img_bgr: np.ndarray,
+    mask: np.ndarray,
+    outputs_root: Path,
+    prefix: str = "debug_input",
+) -> tuple[Optional[Path], Optional[Path]]:
+    """
+    Save debug images (image and mask) before inpainting for debugging purposes.
+
+    Args:
+        img_bgr: BGR image as numpy array
+        mask: Binary mask as numpy array (uint8, 0 or 255)
+        outputs_root: Root directory for saving outputs
+        prefix: Prefix for filename (e.g., "debug_input_crop" or "debug_input_full")
+
+    Returns:
+        (image_path, mask_path) tuple on success, (None, None) on failure.
+    """
+    try:
+        from uuid import uuid4
+
+        debug_dir = outputs_root / "debug" / datetime.now().strftime("%Y%m%d")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        uid = uuid4().hex[:8]
+        
+        # Convert BGR to RGB for saving
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        mask_rgb = cv2.cvtColor(mask, cv2.COLOR_GRAY2RGB)
+        
+        image_path = debug_dir / f"{prefix}_image_{uid}.png"
+        mask_path = debug_dir / f"{prefix}_mask_{uid}.png"
+        
+        Image.fromarray(img_rgb).save(image_path, format="PNG")
+        Image.fromarray(mask_rgb).save(mask_path, format="PNG")
+        
+        logger.debug("Saved debug images: %s, %s", image_path, mask_path)
+        return image_path, mask_path
+    except Exception:
+        logger.warning("Failed to save debug images.", exc_info=True)
+        return None, None
+
+
+def save_debug_mask(
+    mask: np.ndarray,
+    outputs_root: Path,
+    prefix: str = "debug_mask",
+) -> Optional[Path]:
+    """
+    Save a single mask image for debugging purposes.
+
+    Args:
+        mask: Binary mask as numpy array (uint8, 0 or 255)
+        outputs_root: Root directory for saving outputs
+        prefix: Prefix for filename (e.g., "debug_mask_original" or "debug_mask_padded")
+
+    Returns:
+        mask_path on success, None on failure.
+    """
+    try:
+        from uuid import uuid4
+
+        debug_dir = outputs_root / "debug" / datetime.now().strftime("%Y%m%d")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        uid = uuid4().hex[:8]
+        
+        # Convert mask to RGB for saving
+        mask_rgb = cv2.cvtColor(mask, cv2.COLOR_GRAY2RGB)
+        
+        mask_path = debug_dir / f"{prefix}_{uid}.png"
+        Image.fromarray(mask_rgb).save(mask_path, format="PNG")
+        
+        logger.debug("Saved debug mask: %s", mask_path)
+        return mask_path
+    except Exception:
+        logger.warning("Failed to save debug mask.", exc_info=True)
+        return None
+
+
 def save_outputs_to_disk(
     final_rgb: np.ndarray,
     mask_rgb: np.ndarray,
@@ -783,15 +861,18 @@ def get_text_and_bg_colors_from_roi(roi_bgr, border_pct=0.15, k_clusters=8, bg_t
 
 
 def build_mask_from_polygons(
-    h: int, w: int, polygons: list[list[tuple[float, float]]]
+    h: int, w: int, polygons: list[list[tuple[float, float]]],
+    padding: int = 0,
 ) -> np.ndarray:
     """
     Return a binary uint8 mask (0 or 255) built from a list of polygons.
+    Optionally applies padding (dilation) to expand the mask.
 
     Args:
         h: Image height
         w: Image width
         polygons: List of polygons, each polygon is a list of (x, y) tuples
+        padding: Padding/dilation size in pixels (default: 0 = no padding)
 
     Returns:
         Binary mask as uint8 numpy array
@@ -803,7 +884,105 @@ def build_mask_from_polygons(
         poly_pts[:, :, 0] = np.clip(poly_pts[:, :, 0], 0, w - 1)
         poly_pts[:, :, 1] = np.clip(poly_pts[:, :, 1], 0, h - 1)
         cv2.fillPoly(mask, [poly_pts], 255)
+    
+    # Apply padding (dilation) if specified
+    if padding > 0:
+        kernel = np.ones((2 * padding + 1, 2 * padding + 1), np.uint8)
+        mask = cv2.dilate(mask, kernel, iterations=1)
+        logger.debug("Applied mask padding of %d pixels", padding)
+    
     return mask
+
+
+def calculate_expanded_crop_region(
+    mask: np.ndarray,
+    max_mask_ratio: float = 0.15,
+    min_expansion: int = 50,
+    max_expansion: int = 500,
+) -> tuple[int, int, int, int]:
+    """
+    Calculate expanded crop region around masked area to ensure mask ratio <= max_mask_ratio.
+    
+    Args:
+        mask: Binary mask as uint8 numpy array (0 or 255)
+        max_mask_ratio: Maximum allowed ratio of masked pixels to total crop pixels (default: 0.15)
+        min_expansion: Minimum expansion in pixels (default: 50)
+        max_expansion: Maximum expansion in pixels (default: 500)
+        
+    Returns:
+        Tuple of (min_x, min_y, max_x, max_y) for expanded crop region
+    """
+    h, w = mask.shape
+    
+    # Find bounding box of masked region
+    masked_pixels = np.where(mask > 0)
+    if len(masked_pixels[0]) == 0:
+        # No masked pixels, return full image
+        return 0, 0, w, h
+    
+    min_y_mask = int(np.min(masked_pixels[0]))
+    max_y_mask = int(np.max(masked_pixels[0]))
+    min_x_mask = int(np.min(masked_pixels[1]))
+    max_x_mask = int(np.max(masked_pixels[1]))
+    
+    # Count masked pixels in bounding box
+    mask_bbox_area = (max_x_mask - min_x_mask + 1) * (max_y_mask - min_y_mask + 1)
+    masked_count = np.sum(mask[min_y_mask:max_y_mask+1, min_x_mask:max_x_mask+1] > 0)
+    
+    if mask_bbox_area == 0:
+        return 0, 0, w, h
+    
+    # Calculate current mask ratio
+    current_ratio = masked_count / mask_bbox_area
+    
+    # If already below threshold, use minimum expansion
+    if current_ratio <= max_mask_ratio:
+        expansion = min_expansion
+    else:
+        # Calculate required expansion to achieve target ratio
+        # masked_count / (expanded_area) <= max_mask_ratio
+        # expanded_area >= masked_count / max_mask_ratio
+        required_area = masked_count / max_mask_ratio
+        
+        # Current bbox dimensions
+        bbox_w = max_x_mask - min_x_mask + 1
+        bbox_h = max_y_mask - min_y_mask + 1
+        
+        # Calculate expansion needed
+        # (bbox_w + 2*expansion) * (bbox_h + 2*expansion) >= required_area
+        # Solve for expansion: expansion = (sqrt(required_area) - min(bbox_w, bbox_h)) / 2
+        
+        # Use iterative approach for more accurate calculation
+        expansion = min_expansion
+        for exp in range(min_expansion, max_expansion + 1, 10):
+            expanded_w = bbox_w + 2 * exp
+            expanded_h = bbox_h + 2 * exp
+            expanded_area = expanded_w * expanded_h
+            if expanded_area >= required_area:
+                expansion = exp
+                break
+        else:
+            expansion = max_expansion
+    
+    # Calculate expanded crop region
+    min_x = max(0, min_x_mask - expansion)
+    min_y = max(0, min_y_mask - expansion)
+    max_x = min(w, max_x_mask + expansion + 1)
+    max_y = min(h, max_y_mask + expansion + 1)
+    
+    # Verify mask ratio in expanded region
+    expanded_mask = mask[min_y:max_y, min_x:max_x]
+    expanded_area = expanded_mask.size
+    expanded_masked_count = np.sum(expanded_mask > 0)
+    
+    if expanded_area > 0:
+        final_ratio = expanded_masked_count / expanded_area
+        logger.debug(
+            f"Expanded crop: ({min_x}, {min_y}) to ({max_x}, {max_y}), "
+            f"mask ratio: {final_ratio:.3f} (target: ≤{max_mask_ratio})"
+        )
+    
+    return min_x, min_y, max_x, max_y
 
 
 def _extract_text_from_single_polygon(

@@ -36,10 +36,14 @@ load_dotenv()
 from helper import (
     bgr_to_hex,
     build_mask_from_polygons,
+    calculate_expanded_crop_region,
     extract_text_from_polygons,
+    get_text_and_bg_colors_from_roi,
     inpaint,
     np_to_b64_png,
     parse_polygons,
+    save_debug_images,
+    save_debug_mask,
     save_outputs_to_disk,
 )
 
@@ -82,6 +86,18 @@ OCRFLUX_MAX_MODEL_LEN = int(os.getenv("OCRFLUX_MAX_MODEL_LEN", "8192"))
 # OCRFlux processing mode: "per_polygon" (default, processes each cropped region) 
 # or "full_image" (processes full image once, then extracts text per polygon)
 OCRFLUX_MODE = os.getenv("OCRFLUX_MODE", "per_polygon").lower()
+
+# OCR Configuration
+USE_OCR = os.getenv("USE_OCR", "false").lower() in ("true", "1", "yes")  # Enable OCR text extraction (default: false)
+
+# Inpainting crop expansion configuration
+INPAINT_USE_EXPANDED_CROP = os.getenv("INPAINT_USE_EXPANDED_CROP", "true").lower() in ("true", "1", "yes")  # Use expanded crop (default) or full image
+INPAINT_MAX_MASK_RATIO = float(os.getenv("INPAINT_MAX_MASK_RATIO", "0.15"))  # Max mask ratio in expanded crop
+INPAINT_MIN_EXPANSION = int(os.getenv("INPAINT_MIN_EXPANSION", "50"))  # Minimum expansion in pixels
+INPAINT_MAX_EXPANSION = int(os.getenv("INPAINT_MAX_EXPANSION", "500"))  # Maximum expansion in pixels
+
+# Mask padding configuration
+MASK_PADDING = int(os.getenv("MASK_PADDING", "0"))  # Padding/dilation size in pixels (default: 0 = no padding)
 
 # ---------------------------------------------------------------------------
 # Logging — use structured logging; replace with your log aggregator adapter
@@ -159,7 +175,8 @@ async def lifespan(app: FastAPI):
 
     logger.info("Starting up: loading models…")
     _lama_inpaint_fn = _load_lama_inpaint_fn()
-    _ocr_model = _load_ocr_model()
+    if USE_OCR:
+        _ocr_model = _load_ocr_model()
 
     if not LAMA_MODEL_PATH.exists():
         logger.warning("LaMa model directory not found at %s — LaMa inpainting disabled.", LAMA_MODEL_PATH)
@@ -240,14 +257,52 @@ async def process_with_roi(
 
     # Note: Global background detection removed - using polygon-specific detection only
 
-    # Build mask
-    mask_full = build_mask_from_polygons(h_orig, w_orig, polygons_list)
-    logger.info("Mask built from %d polygon(s) for a %dx%d image.", len(polygons_list), w_orig, h_orig)
+    # Build original mask (without padding) for debugging
+    mask_original = build_mask_from_polygons(h_orig, w_orig, polygons_list, padding=0)
+    
+    # Build mask with optional padding (this will be used for inpainting)
+    mask_full = build_mask_from_polygons(h_orig, w_orig, polygons_list, padding=MASK_PADDING)
+    
+    # Save both masks for debugging
+    if MASK_PADDING > 0:
+        print(f"\n[Mask Debug] Built mask with original polygon boundaries and with {MASK_PADDING}px padding.")
+        # Save original mask (without padding)
+        debug_mask_original_path = save_debug_mask(
+            mask_original,
+            OUTPUTS_ROOT,
+            prefix="debug_mask_original",
+        )
+        if debug_mask_original_path:
+            logger.info("Saved original mask (no padding) for debugging: %s", debug_mask_original_path)
+        
+        # Save padded mask (with padding)
+        debug_mask_padded_path = save_debug_mask(
+            mask_full,
+            OUTPUTS_ROOT,
+            prefix="debug_mask_padded",
+        )
+        if debug_mask_padded_path:
+            logger.info("Saved padded mask (%dpx padding) for debugging: %s", MASK_PADDING, debug_mask_padded_path)
+    else:
+        # When padding is 0, original and padded masks are identical, save once
+        debug_mask_path = save_debug_mask(
+            mask_full,
+            OUTPUTS_ROOT,
+            prefix="debug_mask",
+        )
+        if debug_mask_path:
+            logger.info("Saved mask for debugging: %s", debug_mask_path)
+    
+    logger.info(
+        "Mask built from %d polygon(s) for a %dx%d image%s.",
+        len(polygons_list), w_orig, h_orig,
+        f" with {MASK_PADDING}px padding" if MASK_PADDING > 0 else ""
+    )
 
     # Extract text from polygons using OCR (in parallel with async)
     text_regions = []
     polygon_colors = []  # Store color for each polygon bounding box
-    if _ocr_model is not None:
+    if USE_OCR and _ocr_model is not None:
         try:
             start_time = time.time()
             text_regions = await extract_text_from_polygons(
@@ -265,8 +320,10 @@ async def process_with_roi(
             )
         except Exception as exc:
             logger.warning("OCR text extraction failed: %s", exc, exc_info=True)
+    elif USE_OCR and _ocr_model is None:
+        logger.warning("OCR is enabled but OCR model not available — skipping text extraction.")
     else:
-        logger.warning("OCR model not available — skipping text extraction.")
+        logger.info("OCR is disabled (USE_OCR=false) — skipping text extraction.")
 
     # Detect color for each polygon bounding box (must be done after OCR to match colors with text)
     print(f"\n[Color Detection] Detecting text and background colors for {len(polygons_list)} polygon(s)...")
@@ -364,18 +421,81 @@ async def process_with_roi(
     else:
         print("[OCR Summary] No text regions extracted from polygons.")
 
-    # Inpaint
+    # Inpaint - choose between expanded crop or full image approach
     inpainting_start_time = time.time()
-    inpainted_bgr, inpainting_method = inpaint(
-        img_bgr,
-        mask_full,
-        lama_inpaint_fn=_lama_inpaint_fn,
-        lama_model_path=LAMA_MODEL_PATH,
-        device=DEVICE,
-    )
+    
+    if INPAINT_USE_EXPANDED_CROP:
+        # Option 1: Expanded crop approach (default)
+        # Calculate expanded crop region to ensure mask ratio <= INPAINT_MAX_MASK_RATIO
+        min_x, min_y, max_x, max_y = calculate_expanded_crop_region(
+            mask_full,
+            max_mask_ratio=INPAINT_MAX_MASK_RATIO,
+            min_expansion=INPAINT_MIN_EXPANSION,
+            max_expansion=INPAINT_MAX_EXPANSION,
+        )
+        
+        # Crop image and mask to expanded region
+        img_crop = img_bgr[min_y:max_y, min_x:max_x].copy()
+        mask_crop = mask_full[min_y:max_y, min_x:max_x].copy()
+        
+        logger.info(
+            "Using expanded crop approach - region: (%d, %d) to (%d, %d), "
+            "crop size: %dx%d, original image: %dx%d",
+            min_x, min_y, max_x, max_y,
+            max_x - min_x, max_y - min_y,
+            w_orig, h_orig
+        )
+        
+        # Save debug images before inpainting
+        debug_img_path, debug_mask_path = save_debug_images(
+            img_crop,
+            mask_crop,
+            OUTPUTS_ROOT,
+            prefix="debug_input_crop",
+        )
+        if debug_img_path:
+            logger.info("Saved debug crop image: %s, mask: %s", debug_img_path, debug_mask_path)
+        
+        # Run inpainting on cropped region
+        inpainted_crop, inpainting_method = inpaint(
+            img_crop,
+            mask_crop,
+            lama_inpaint_fn=_lama_inpaint_fn,
+            lama_model_path=LAMA_MODEL_PATH,
+            device=DEVICE,
+        )
+        
+        # Paste inpainted crop back into full image
+        inpainted_bgr = img_bgr.copy()
+        inpainted_bgr[min_y:max_y, min_x:max_x] = inpainted_crop
+        
+        print(f"[Inpainting] Expanded crop: ({min_x}, {min_y}) to ({max_x}, {max_y}), size: {max_x-min_x}x{max_y-min_y}")
+    else:
+        # Option 2: Full image approach (original behavior)
+        logger.info("Using full image approach - processing entire image %dx%d", w_orig, h_orig)
+        
+        # Save debug images before inpainting
+        debug_img_path, debug_mask_path = save_debug_images(
+            img_bgr,
+            mask_full,
+            OUTPUTS_ROOT,
+            prefix="debug_input_full",
+        )
+        if debug_img_path:
+            logger.info("Saved debug full image: %s, mask: %s", debug_img_path, debug_mask_path)
+        
+        inpainted_bgr, inpainting_method = inpaint(
+            img_bgr,
+            mask_full,
+            lama_inpaint_fn=_lama_inpaint_fn,
+            lama_model_path=LAMA_MODEL_PATH,
+            device=DEVICE,
+        )
+    
     inpainting_elapsed_time = time.time() - inpainting_start_time
     logger.info("Inpainting complete using method: %s in %.2f seconds", inpainting_method, inpainting_elapsed_time)
     print(f"[Inpainting] Method: {inpainting_method} | Time taken: {inpainting_elapsed_time:.2f} seconds")
+    print("===== MASK PADDING applied: ", MASK_PADDING)
 
     # Prepare response images
     final_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
@@ -401,5 +521,6 @@ def health():
     return JSONResponse({
         "status": "ok",
         "lama_available": _lama_inpaint_fn is not None and LAMA_MODEL_PATH.exists(),
-        "ocr_available": _ocr_model is not None and OCRFLUX_MODEL_PATH.exists(),
+        "ocr_enabled": USE_OCR,
+        "ocr_available": USE_OCR and _ocr_model is not None and OCRFLUX_MODEL_PATH.exists(),
     })

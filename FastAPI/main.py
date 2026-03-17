@@ -34,10 +34,12 @@ from PIL import Image
 load_dotenv()
 
 from helper import (
+    apply_mask_keep_inside,
     bgr_to_hex,
     build_mask_from_polygons,
     calculate_expanded_crop_region,
     extract_text_from_polygons,
+    get_polygon_bbox,
     get_text_and_bg_colors_from_roi,
     inpaint,
     np_to_b64_png,
@@ -446,7 +448,26 @@ async def process_with_roi(
             w_orig, h_orig
         )
         
-        # Save debug images before inpainting
+        # Save exact user-selected polygon region (masked: original inside white, black outside)
+        px_min, py_min, px_max, py_max = get_polygon_bbox(polygons_list, w_orig, h_orig)
+        if px_max > px_min and py_max > py_min:
+            img_polygon = img_bgr[py_min:py_max, px_min:px_max].copy()
+            mask_polygon = mask_full[py_min:py_max, px_min:px_max].copy()
+            img_polygon_masked = apply_mask_keep_inside(img_polygon, mask_polygon)
+            debug_polygon_img_path, debug_polygon_mask_path = save_debug_images(
+                img_polygon_masked,
+                mask_polygon,
+                OUTPUTS_ROOT,
+                prefix="debug_input_polygon",
+            )
+            if debug_polygon_img_path:
+                logger.info(
+                    "Saved exact user-selected polygon crop (masked) for debugging: %s, mask: %s",
+                    debug_polygon_img_path,
+                    debug_polygon_mask_path,
+                )
+        
+        # Save debug images (expanded crop with extra area) before inpainting
         debug_img_path, debug_mask_path = save_debug_images(
             img_crop,
             mask_crop,
@@ -473,6 +494,25 @@ async def process_with_roi(
     else:
         # Option 2: Full image approach (original behavior)
         logger.info("Using full image approach - processing entire image %dx%d", w_orig, h_orig)
+        
+        # Save exact user-selected polygon region (masked: original inside white, black outside)
+        px_min, py_min, px_max, py_max = get_polygon_bbox(polygons_list, w_orig, h_orig)
+        if px_max > px_min and py_max > py_min:
+            img_polygon = img_bgr[py_min:py_max, px_min:px_max].copy()
+            mask_polygon = mask_full[py_min:py_max, px_min:px_max].copy()
+            img_polygon_masked = apply_mask_keep_inside(img_polygon, mask_polygon)
+            debug_polygon_img_path, debug_polygon_mask_path = save_debug_images(
+                img_polygon_masked,
+                mask_polygon,
+                OUTPUTS_ROOT,
+                prefix="debug_input_polygon",
+            )
+            if debug_polygon_img_path:
+                logger.info(
+                    "Saved exact user-selected polygon crop (masked) for debugging: %s, mask: %s",
+                    debug_polygon_img_path,
+                    debug_polygon_mask_path,
+                )
         
         # Save debug images before inpainting
         debug_img_path, debug_mask_path = save_debug_images(

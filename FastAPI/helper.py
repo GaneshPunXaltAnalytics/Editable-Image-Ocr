@@ -90,6 +90,23 @@ def inpaint(
     return opencv_inpaint(img_bgr, mask), "opencv"
 
 
+def apply_mask_keep_inside(img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """
+    Apply mask to image: keep original content where mask is white (255),
+    set pixels to black where mask is black (0).
+
+    Args:
+        img_bgr: BGR image as numpy array
+        mask: Binary mask (uint8, 0 or 255)
+
+    Returns:
+        Masked BGR image (same shape as img_bgr)
+    """
+    result = img_bgr.copy()
+    result[mask == 0] = 0
+    return result
+
+
 def save_debug_images(
     img_bgr: np.ndarray,
     mask: np.ndarray,
@@ -237,6 +254,33 @@ def parse_polygons(raw: str) -> list[list[tuple[float, float]]]:
                 ) from exc
         result.append(pts)
     return result
+
+
+def get_polygon_bbox(
+    polygons: list[list[tuple[float, float]]],
+    img_w: int,
+    img_h: int,
+) -> tuple[int, int, int, int]:
+    """
+    Get tight bounding box of all polygons, clamped to image bounds.
+
+    Returns:
+        (min_x, min_y, max_x, max_y) for slicing img[min_y:max_y, min_x:max_x]
+    """
+    min_x = min_y = float("inf")
+    max_x = max_y = float("-inf")
+    for pts in polygons:
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        min_x = min(min_x, min(xs))
+        min_y = min(min_y, min(ys))
+        max_x = max(max_x, max(xs))
+        max_y = max(max_y, max(ys))
+    min_x = max(0, int(min_x))
+    min_y = max(0, int(min_y))
+    max_x = min(img_w, int(max_x) + 1)
+    max_y = min(img_h, int(max_y) + 1)
+    return min_x, min_y, max_x, max_y
 
 
 def bgr_to_hex(bgr):

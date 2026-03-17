@@ -1,5 +1,6 @@
 import copy
 import logging
+import os
 from typing import Dict, Tuple
 
 import pandas as pd
@@ -67,7 +68,9 @@ class BaseInpaintingTrainingModule(ptl.LightningModule):
         self.generator = make_generator(config, **self.config.generator)
         self.use_ddp = use_ddp
 
-        if not get_has_ddp_rank():
+        # Avoid dumping full model architectures to console by default.
+        # Set SHOW_MODEL_ARCH=1 if you explicitly want them logged.
+        if (not get_has_ddp_rank()) and (os.getenv("SHOW_MODEL_ARCH", "0") in ("1", "true", "yes")):
             LOGGER.info(f'Generator\n{self.generator}')
 
         if not predict_only:
@@ -78,7 +81,7 @@ class BaseInpaintingTrainingModule(ptl.LightningModule):
             self.val_evaluator = make_evaluator(**self.config.evaluator)
             self.test_evaluator = make_evaluator(**self.config.evaluator)
 
-            if not get_has_ddp_rank():
+            if (not get_has_ddp_rank()) and (os.getenv("SHOW_MODEL_ARCH", "0") in ("1", "true", "yes")):
                 LOGGER.info(f'Discriminator\n{self.discriminator}')
 
             extra_val = self.config.data.get('extra_val', ())

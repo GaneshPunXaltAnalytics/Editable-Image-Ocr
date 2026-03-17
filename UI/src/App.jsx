@@ -155,6 +155,7 @@ export default function App() {
   const [selectedFullFinalTextId, setSelectedFullFinalTextId] = useState(null); // show border only when this region is selected
   const [selectedCompositeTextId, setSelectedCompositeTextId] = useState(null);
   const [compositeEditorPosition, setCompositeEditorPosition] = useState(null); // { left, top } when user has dragged the panel
+  const [openAiMeta, setOpenAiMeta] = useState(null); // { enabled, model, cost_usd, error }
 
   const rightImgRef = useRef(null);
   const compositeEditorDragRef = useRef(null); // { clientX, clientY, startLeft, startTop } while dragging
@@ -830,17 +831,15 @@ export default function App() {
       });
       if (!res.ok) return;
       const json = await res.json().catch(() => null);
-      if (json && json.text_regions && json.text_regions.length > 0) {
-        const region = json.text_regions[0];
-        if (region.color) {
-          setPolygonColors(prev => ({
-            ...prev,
-            [polygonId]: {
-              color: region.color,
-              background_color: region.background_color,
-            }
-          }));
-        }
+      const dominant = json?.roi_dominant_text_color || null;
+      if (dominant) {
+        setPolygonColors(prev => ({
+          ...prev,
+          [polygonId]: {
+            color: dominant,
+            background_color: null,
+          }
+        }));
       }
     } catch (err) {
       console.error("Failed to fetch polygon color:", err);
@@ -1150,6 +1149,7 @@ export default function App() {
                     return;
                   }
                   setFullFinal("data:image/png;base64," + json.final);
+                  setOpenAiMeta(json.openai || null);
                   if (json.image_width != null && json.image_height != null) {
                     setFullFinalImageSize({ width: json.image_width, height: json.image_height });
                   }
@@ -1428,6 +1428,21 @@ export default function App() {
             <h4>Final (Full Image) — detected text (drag to move, click to edit)</h4>
             {fullFinal ? (
               <>
+                {openAiMeta && (
+                  <div className="card" style={{ margin: "8px 0", padding: 10 }}>
+                    <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+                      <strong>OpenAI</strong>
+                      <span>enabled: {String(!!openAiMeta.enabled)}</span>
+                      {openAiMeta.model ? <span>model: {String(openAiMeta.model)}</span> : null}
+                      {typeof openAiMeta.cost_usd === "number" ? (
+                        <span>cost: ${openAiMeta.cost_usd.toFixed(6)}</span>
+                      ) : null}
+                      {openAiMeta.error ? (
+                        <span style={{ color: "#b91c1c" }}>error: {String(openAiMeta.error)}</span>
+                      ) : null}
+                    </div>
+                  </div>
+                )}
                 <div className="final-image-wrapper" style={{ position: "relative", display: "inline-block", maxWidth: "100%" }}>
                   <img
                     ref={fullFinalImgRef}

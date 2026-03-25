@@ -715,16 +715,21 @@ export default function App() {
       const maxY = Math.max(...box.map(p => p[1]));
       const fontSize = Math.max(10, (maxY - minY) * 0.72);
       const lineHeight = fontSize * 1.2;
+      const angleDeg = Number(region.angle_deg || 0);
+      const angleRad = (angleDeg * Math.PI) / 180;
 
       const regionFontFamily = (region.fontFamily && region.fontFamily.trim()) ? region.fontFamily.trim() : "sans-serif";
 
       const coloredLines = parseHtmlToColoredLines(region.html);
       ctx.textBaseline = "top";
+      ctx.save();
+      ctx.translate(minX, minY);
+      ctx.rotate(angleRad);
 
       if (coloredLines && coloredLines.length > 0) {
-        let y = minY;
+        let y = 0;
         for (const line of coloredLines) {
-          let x = minX;
+          let x = 0;
           for (const seg of line) {
             // Use detected text color if available, otherwise use HTML color or default
             ctx.fillStyle = region.color || seg.color || defaultColor;
@@ -752,8 +757,9 @@ export default function App() {
         // Use detected text color if available
         ctx.fillStyle = region.color || defaultColor;
         ctx.font = toCanvasFont(fontSize, regionFontFamily);
-        ctx.fillText(region.text || "", minX, minY);
+        ctx.fillText(region.text || "", 0, 0);
       }
+      ctx.restore();
     }
     return canvas.toDataURL("image/png");
   }
@@ -1153,31 +1159,56 @@ export default function App() {
                   if (json.image_width != null && json.image_height != null) {
                     setFullFinalImageSize({ width: json.image_width, height: json.image_height });
                   }
-                  // Parse text regions from OCR if available
-                  const regions = (json.text_regions || []).map((r) => {
-                    // Calculate bounding box from polygon coordinates for positioning
-                    let box = [[0, 0], [0, 0], [0, 0], [0, 0]];
-                    if (Array.isArray(r.polygon) && r.polygon.length > 0) {
-                      const xs = r.polygon.map(p => Number(p.x || (Array.isArray(p) ? p[0] : 0)));
-                      const ys = r.polygon.map(p => Number(p.y || (Array.isArray(p) ? p[1] : 0)));
-                      const minX = Math.min(...xs);
-                      const minY = Math.min(...ys);
-                      const maxX = Math.max(...xs);
-                      const maxY = Math.max(...ys);
-                      box = [[minX, minY], [maxX, minY], [maxX, maxY], [minX, maxY]];
-                    }
-                    return {
-                      id: cryptoRandomId(),
-                      text: r.text != null ? String(r.text) : "",
-                      score: r.score != null ? Number(r.score) : 1,
-                      polygon: Array.isArray(r.polygon) ? r.polygon : [],
-                      box: box,
-                      color: r.color || null,
-                      color_bgr: r.color_bgr || null,
-                      background_color: r.background_color || null,
-                      background_color_bgr: r.background_color_bgr || null,
-                    };
-                  });
+                  // Parse text regions from OCR if available.
+                  // Preferred geometry source: backend-echoed original polygons.
+                  const responsePolygons = Array.isArray(json.polygons) ? json.polygons : [];
+                  const ocrRegions = Array.isArray(json.text_regions) ? json.text_regions : [];
+                  const polygonToBox = (poly) => {
+                    if (!Array.isArray(poly) || poly.length === 0) return [[0, 0], [0, 0], [0, 0], [0, 0]];
+                    const xs = poly.map((p) => Number(p?.x ?? (Array.isArray(p) ? p[0] : 0)));
+                    const ys = poly.map((p) => Number(p?.y ?? (Array.isArray(p) ? p[1] : 0)));
+                    const minX = Math.min(...xs);
+                    const minY = Math.min(...ys);
+                    const maxX = Math.max(...xs);
+                    const maxY = Math.max(...ys);
+                    return [[minX, minY], [maxX, minY], [maxX, maxY], [minX, maxY]];
+                  };
+
+                  let regions = [];
+                  if (responsePolygons.length > 0) {
+                    regions = responsePolygons.map((poly, idx) => {
+                      const textInfo = ocrRegions[idx] || {};
+                      return {
+                        id: cryptoRandomId(),
+                        text: textInfo.text != null ? String(textInfo.text) : "",
+                        score: textInfo.score != null ? Number(textInfo.score) : 1,
+                        polygon: poly,
+                        angle_deg: textInfo.angle_deg != null ? Number(textInfo.angle_deg) : 0,
+                        box: polygonToBox(poly),
+                        color: textInfo.color || null,
+                        color_bgr: textInfo.color_bgr || null,
+                        background_color: textInfo.background_color || null,
+                        background_color_bgr: textInfo.background_color_bgr || null,
+                      };
+                    });
+                  } else {
+                    // Backward compatibility for older backend responses.
+                    regions = ocrRegions.map((r) => {
+                      const poly = Array.isArray(r.polygon) ? r.polygon : [];
+                      return {
+                        id: cryptoRandomId(),
+                        text: r.text != null ? String(r.text) : "",
+                        score: r.score != null ? Number(r.score) : 1,
+                        polygon: poly,
+                        angle_deg: r.angle_deg != null ? Number(r.angle_deg) : 0,
+                        box: polygonToBox(poly),
+                        color: r.color || null,
+                        color_bgr: r.color_bgr || null,
+                        background_color: r.background_color || null,
+                        background_color_bgr: r.background_color_bgr || null,
+                      };
+                    });
+                  }
                   setTextRegions(regions);
                   
                   // Store polygon colors from response
@@ -1498,6 +1529,8 @@ export default function App() {
                               top,
                               width,
                               height,
+                              transform: `rotate(${Number(region.angle_deg || 0)}deg)`,
+                              transformOrigin: "top left",
                               pointerEvents: "auto",
                               cursor: "move",
                               border: isSelected ? "1px solid rgba(37,99,235,0.7)" : "1px solid transparent",
@@ -1505,7 +1538,7 @@ export default function App() {
                               padding: "1px 4px",
                               fontSize: Math.max(10, height * 0.7),
                               lineHeight: 1.1,
-                              overflow: "hidden",
+                              overflow: "visible",
                               boxSizing: "border-box",
                             }}
                             onClick={(e) => e.stopPropagation()}
@@ -1676,6 +1709,8 @@ export default function App() {
                         top,
                         width,
                         height,
+                        transform: `rotate(${Number(region.angle_deg || 0)}deg)`,
+                        transformOrigin: "top left",
                         pointerEvents: "auto",
                         cursor: "move",
                         border: isSelected ? "1px solid rgba(37,99,235,0.7)" : "1px solid transparent",
@@ -1683,7 +1718,7 @@ export default function App() {
                         padding: "1px 4px",
                         fontSize: Math.max(10, height * 0.7),
                         lineHeight: 1.1,
-                        overflow: "hidden",
+                        overflow: "visible",
                         boxSizing: "border-box",
                       }}
                       onClick={(e) => e.stopPropagation()}

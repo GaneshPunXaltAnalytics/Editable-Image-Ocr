@@ -45,7 +45,6 @@ from helper import (
     bgr_to_hex,
     build_mask_from_polygons,
     calculate_expanded_crop_region,
-    extract_text_from_polygons,
     get_polygon_bbox,
     inpaint,
     np_to_b64_png,
@@ -88,20 +87,8 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 API_TITLE = os.getenv("API_TITLE", "Image Inpainting API")
 DEVICE = os.getenv("DEVICE", "cpu")
 
-# OCRFlux configuration
-OCRFLUX_MODEL_PATH_STR = os.getenv("OCRFLUX_MODEL_PATH", "./models/OCRFlux-3B")
-OCRFLUX_MODEL_PATH = (
-    Path(OCRFLUX_MODEL_PATH_STR) if Path(OCRFLUX_MODEL_PATH_STR).is_absolute()
-    else PROJECT_ROOT / OCRFLUX_MODEL_PATH_STR
-)
-OCRFLUX_GPU_UTIL = float(os.getenv("OCRFLUX_GPU_UTIL", "0.8"))
-OCRFLUX_MAX_MODEL_LEN = int(os.getenv("OCRFLUX_MAX_MODEL_LEN", "8192"))
-# OCRFlux processing mode: "per_polygon" (default, processes each cropped region) 
-# or "full_image" (processes full image once, then extracts text per polygon)
-OCRFLUX_MODE = os.getenv("OCRFLUX_MODE", "per_polygon").lower()
-
-# OCR Configuration
-USE_OCR = os.getenv("USE_OCR", "false").lower() in ("true", "1", "yes")  # Enable OCR text extraction (default: false)
+# OCR/OpenAI configuration
+USE_OCR = os.getenv("USE_OCR", "true").lower() in ("true", "1", "yes")
 
 # OpenAI vision configuration (used for text+color extraction)
 OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini")
@@ -131,8 +118,9 @@ def _calculate_openai_cost_from_usage(usage: Any, model: str) -> float:
     if base_model not in _OPENAI_PRICING_PER_1K or not usage:
         return 0.0
     rates = _OPENAI_PRICING_PER_1K[base_model]
-    prompt_tokens = getattr(usage, "input_tokens", getattr(usage, "prompt_tokens", 0))
-    completion_tokens = getattr(usage, "output_tokens", getattr(usage, "completion_tokens", 0))
+    # Match openai_vision.py token extraction order exactly.
+    prompt_tokens = getattr(usage, "prompt_tokens", None) or getattr(usage, "input_tokens", 0)
+    completion_tokens = getattr(usage, "completion_tokens", None) or getattr(usage, "output_tokens", 0)
     return (prompt_tokens / 1000.0) * rates["prompt"] + (completion_tokens / 1000.0) * rates["completion"]
 
 
@@ -250,6 +238,7 @@ def _words_to_text_regions_fallback(
     py_min: int,
     crop_w: int,
     crop_h: int,
+    angle_deg: float = 0.0,
 ) -> list[dict[str, Any]]:
     """
     If the model returns words without bounding boxes, synthesize simple word boxes
@@ -291,6 +280,7 @@ def _words_to_text_regions_fallback(
             {
                 "text": text,
                 "score": float(w.get("confidence")) if w.get("confidence") is not None else 1.0,
+                "angle_deg": float(angle_deg),
                 "polygon": [
                     {"x": fx0, "y": fy0},
                     {"x": fx1, "y": fy0},
@@ -308,6 +298,33 @@ def _words_to_text_regions_fallback(
         x += est_w + space_w
 
     return regions
+
+
+def _polygon_orientation_deg(polygons: list[list[tuple[float, float]]]) -> float:
+    """
+    Estimate text orientation from user polygon geometry.
+    Uses minAreaRect and normalizes the angle so horizontal text is near 0 deg.
+    """
+    points: list[list[float]] = []
+    for poly in polygons or []:
+        for x, y in poly:
+            points.append([float(x), float(y)])
+    if len(points) < 3:
+        return 0.0
+    try:
+        contour = np.array(points, dtype=np.float32).reshape((-1, 1, 2))
+        _, (w, h), angle = cv2.minAreaRect(contour)
+        # OpenCV angle is usually in [-90, 0). Normalize along major axis.
+        if w < h:
+            angle += 90.0
+        # Keep angle in [-90, 90] for easier UI usage.
+        while angle <= -90.0:
+            angle += 180.0
+        while angle > 90.0:
+            angle -= 180.0
+        return float(angle)
+    except Exception:
+        return 0.0
 
 # Inpainting crop expansion configuration
 INPAINT_USE_EXPANDED_CROP = os.getenv("INPAINT_USE_EXPANDED_CROP", "true").lower() in ("true", "1", "yes")  # Use expanded crop (default) or full image
@@ -331,7 +348,6 @@ logger = logging.getLogger("text_removal_api")
 # Module-level singletons — populated during lifespan startup
 # ---------------------------------------------------------------------------
 _lama_inpaint_fn: Any = None       # callable or None if LaMa unavailable
-_ocr_model: Any = None              # OCRFlux LLM model instance
 
 
 def _load_lama_inpaint_fn():
@@ -352,50 +368,15 @@ def _load_lama_inpaint_fn():
         return None
 
 
-def _load_ocr_model():
-    """
-    Initialize OCRFlux model once at startup.
-    Returns the OCRFlux LLM model instance or None if unavailable.
-    """
-    try:
-        from vllm import LLM
-        
-        if not OCRFLUX_MODEL_PATH.exists():
-            logger.warning(
-                "OCRFlux model directory not found at %s — OCR text extraction unavailable.",
-                OCRFLUX_MODEL_PATH,
-            )
-            return None
-        
-        logger.info("Loading OCRFlux model from %s...", OCRFLUX_MODEL_PATH)
-        llm = LLM(
-            model=str(OCRFLUX_MODEL_PATH),
-            dtype='half',  # float16 — required for T4/V100 (compute < 8.0)
-            gpu_memory_utilization=OCRFLUX_GPU_UTIL,
-            max_model_len=OCRFLUX_MAX_MODEL_LEN,
-            trust_remote_code=True,
-        )
-        logger.info("OCRFlux model loaded successfully.")
-        return llm
-    except Exception:
-        logger.warning(
-            "Could not load OCRFlux — OCR text extraction unavailable.",
-            exc_info=True,
-        )
-        return None
-
-
 # ---------------------------------------------------------------------------
 # Lifespan: load all heavy resources once, before the first request
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _lama_inpaint_fn, _ocr_model
+    global _lama_inpaint_fn
 
     logger.info("Starting up: loading models…")
     _lama_inpaint_fn = _load_lama_inpaint_fn()
-    if USE_OCR:
-        _ocr_model = _load_ocr_model()
 
     if not LAMA_MODEL_PATH.exists():
         logger.warning("LaMa model directory not found at %s — LaMa inpainting disabled.", LAMA_MODEL_PATH)
@@ -462,6 +443,11 @@ async def process_with_roi(
         polygons_list = parse_polygons(polygons)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    # Echo-safe polygon payload for frontend overlay alignment.
+    polygons_payload = [
+        [{"x": float(x), "y": float(y)} for (x, y) in poly]
+        for poly in polygons_list
+    ]
 
     # Decode image
     data = await file.read()
@@ -473,8 +459,6 @@ async def process_with_roi(
     img_rgb = np.array(pil_img)
     img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
     h_orig, w_orig = img_bgr.shape[:2]
-
-    # Note: Global background detection removed - using polygon-specific detection only
 
     # Build original mask (without padding) for debugging
     mask_original = build_mask_from_polygons(h_orig, w_orig, polygons_list, padding=0)
@@ -518,11 +502,66 @@ async def process_with_roi(
         f" with {MASK_PADDING}px padding" if MASK_PADDING > 0 else ""
     )
 
-    # OpenAI-based extraction (replaces OCR + color detection)
+    # OpenAI-based extraction (per-polygon so UI can map exactly to user geometry)
     text_regions: list[dict[str, Any]] = []
-    openai_words: list[dict[str, Any]] = []
-    openai_meta: dict[str, Any] = {"enabled": False}
+    openai_words_all: list[dict[str, Any]] = []
+    openai_errors: list[str] = []
+    openai_enabled_any = False
+    openai_model_used = OPENAI_VISION_MODEL
+    openai_total_cost = 0.0
+    px_min_all, py_min_all, px_max_all, py_max_all = get_polygon_bbox(polygons_list, w_orig, h_orig)
     roi_crop_bbox: dict[str, int] | None = None
+    if px_max_all > px_min_all and py_max_all > py_min_all:
+        roi_crop_bbox = {
+            "x": int(px_min_all),
+            "y": int(py_min_all),
+            "width": int(px_max_all - px_min_all),
+            "height": int(py_max_all - py_min_all),
+        }
+
+    for poly_idx, polygon in enumerate(polygons_list):
+        px_min, py_min, px_max, py_max = get_polygon_bbox([polygon], w_orig, h_orig)
+        if not (px_max > px_min and py_max > py_min):
+            continue
+        poly_mask_full = build_mask_from_polygons(h_orig, w_orig, [polygon], padding=0)
+        img_polygon = img_bgr[py_min:py_max, px_min:px_max].copy()
+        mask_polygon = poly_mask_full[py_min:py_max, px_min:px_max].copy()
+        img_polygon_masked = apply_mask_keep_inside(img_polygon, mask_polygon)
+
+        words, meta = _openai_analyze_polygon_crop(img_polygon_masked)
+        openai_words_all.extend(words)
+        openai_enabled_any = openai_enabled_any or bool(meta.get("enabled", False))
+        if meta.get("model"):
+            openai_model_used = str(meta.get("model"))
+        openai_total_cost += float(meta.get("cost_usd", 0.0) or 0.0)
+        if meta.get("error"):
+            openai_errors.append(str(meta.get("error")))
+
+        text_parts = [str(w.get("text") or "").strip() for w in words]
+        text_parts = [t for t in text_parts if t]
+        score_vals = [float(w.get("confidence")) for w in words if w.get("confidence") is not None]
+        poly_angle_deg = _polygon_orientation_deg([polygon])
+        polygon_payload = [{"x": float(x), "y": float(y)} for (x, y) in polygon]
+
+        text_regions.append(
+            {
+                "text": " ".join(text_parts),
+                "score": float(sum(score_vals) / len(score_vals)) if score_vals else 1.0,
+                "polygon_index": int(poly_idx),
+                "angle_deg": float(poly_angle_deg),
+                "polygon": polygon_payload,
+                "color": _dominant_hex_color(words),
+                "bounding_box": [float(px_min), float(py_min), float(px_max - px_min), float(py_max - py_min)],
+            }
+        )
+
+    roi_dominant_text_color = _dominant_hex_color(openai_words_all)
+    openai_meta: dict[str, Any] = {
+        "enabled": bool(openai_enabled_any),
+        "model": openai_model_used,
+        "cost_usd": float(openai_total_cost),
+        "error": "; ".join(sorted(set(openai_errors))) if openai_errors else None,
+    }
 
     # Inpaint - choose between expanded crop or full image approach
     inpainting_start_time = time.time()
@@ -548,76 +587,6 @@ async def process_with_roi(
             max_x - min_x, max_y - min_y,
             w_orig, h_orig
         )
-        
-        # Save exact user-selected polygon region (masked: original inside white, black outside)
-        px_min, py_min, px_max, py_max = get_polygon_bbox(polygons_list, w_orig, h_orig)
-        if px_max > px_min and py_max > py_min:
-            img_polygon = img_bgr[py_min:py_max, px_min:px_max].copy()
-            mask_polygon = mask_full[py_min:py_max, px_min:px_max].copy()
-            img_polygon_masked = apply_mask_keep_inside(img_polygon, mask_polygon)
-            roi_crop_bbox = {"x": int(px_min), "y": int(py_min), "width": int(px_max - px_min), "height": int(py_max - py_min)}
-            debug_polygon_img_path, debug_polygon_mask_path = save_debug_images(
-                img_polygon_masked,
-                mask_polygon,
-                OUTPUTS_ROOT,
-                prefix="debug_input_polygon",
-            )
-            if debug_polygon_img_path:
-                logger.info(
-                    "Saved exact user-selected polygon crop (masked) for debugging: %s, mask: %s",
-                    debug_polygon_img_path,
-                    debug_polygon_mask_path,
-                )
-
-            # OpenAI analysis on the saved polygon crop image
-            openai_words, openai_meta = _openai_analyze_polygon_crop(img_polygon_masked)
-            print(f"=========== openai_meta:  {openai_meta} and openai_words: {openai_words}")
-            roi_dominant_text_color = _dominant_hex_color(openai_words)
-            # Convert OpenAI word bounding boxes (crop-relative) -> full-image `text_regions`
-            used_bb = False
-            for w in openai_words:
-                bb = w.get("bounding_box")
-                if not (isinstance(bb, (list, tuple)) and len(bb) == 4):
-                    continue
-                used_bb = True
-                try:
-                    x, y, ww, hh = (float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3]))
-                except Exception:
-                    continue
-                fx0 = float(px_min) + x
-                fy0 = float(py_min) + y
-                fx1 = fx0 + ww
-                fy1 = fy0 + hh
-                text_regions.append(
-                    {
-                        "text": w.get("text") if w.get("text") is not None else "",
-                        "score": float(w.get("confidence")) if w.get("confidence") is not None else 1.0,
-                        "polygon": [
-                            {"x": fx0, "y": fy0},
-                            {"x": fx1, "y": fy0},
-                            {"x": fx1, "y": fy1},
-                            {"x": fx0, "y": fy1},
-                        ],
-                        "color": w.get("color"),
-                        "font_weight": w.get("font_weight"),
-                        "font_style": w.get("font_style"),
-                        "font_family": w.get("font_family"),
-                        "bounding_box": [fx0, fy0, fx1 - fx0, fy1 - fy0],
-                    }
-                )
-            if openai_words and not used_bb and not text_regions:
-                logger.info("[OpenAI Vision] No bounding_box in response; using fallback boxes for UI display.")
-                text_regions.extend(
-                    _words_to_text_regions_fallback(
-                        openai_words,
-                        px_min=int(px_min),
-                        py_min=int(py_min),
-                        crop_w=int(px_max - px_min),
-                        crop_h=int(py_max - py_min),
-                    )
-                )
-        else:
-            roi_dominant_text_color = None
         
         # Save debug images (expanded crop with extra area) before inpainting
         debug_img_path, debug_mask_path = save_debug_images(
@@ -646,73 +615,6 @@ async def process_with_roi(
     else:
         # Option 2: Full image approach (original behavior)
         logger.info("Using full image approach - processing entire image %dx%d", w_orig, h_orig)
-        
-        # Save exact user-selected polygon region (masked: original inside white, black outside)
-        px_min, py_min, px_max, py_max = get_polygon_bbox(polygons_list, w_orig, h_orig)
-        if px_max > px_min and py_max > py_min:
-            img_polygon = img_bgr[py_min:py_max, px_min:px_max].copy()
-            mask_polygon = mask_full[py_min:py_max, px_min:px_max].copy()
-            img_polygon_masked = apply_mask_keep_inside(img_polygon, mask_polygon)
-            roi_crop_bbox = {"x": int(px_min), "y": int(py_min), "width": int(px_max - px_min), "height": int(py_max - py_min)}
-            debug_polygon_img_path, debug_polygon_mask_path = save_debug_images(
-                img_polygon_masked,
-                mask_polygon,
-                OUTPUTS_ROOT,
-                prefix="debug_input_polygon",
-            )
-            if debug_polygon_img_path:
-                logger.info(
-                    "Saved exact user-selected polygon crop (masked) for debugging: %s, mask: %s",
-                    debug_polygon_img_path,
-                    debug_polygon_mask_path,
-                )
-
-            openai_words, openai_meta = _openai_analyze_polygon_crop(img_polygon_masked)
-            roi_dominant_text_color = _dominant_hex_color(openai_words)
-            used_bb = False
-            for w in openai_words:
-                bb = w.get("bounding_box")
-                if not (isinstance(bb, (list, tuple)) and len(bb) == 4):
-                    continue
-                used_bb = True
-                try:
-                    x, y, ww, hh = (float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3]))
-                except Exception:
-                    continue
-                fx0 = float(px_min) + x
-                fy0 = float(py_min) + y
-                fx1 = fx0 + ww
-                fy1 = fy0 + hh
-                text_regions.append(
-                    {
-                        "text": w.get("text") if w.get("text") is not None else "",
-                        "score": float(w.get("confidence")) if w.get("confidence") is not None else 1.0,
-                        "polygon": [
-                            {"x": fx0, "y": fy0},
-                            {"x": fx1, "y": fy0},
-                            {"x": fx1, "y": fy1},
-                            {"x": fx0, "y": fy1},
-                        ],
-                        "color": w.get("color"),
-                        "font_weight": w.get("font_weight"),
-                        "font_style": w.get("font_style"),
-                        "font_family": w.get("font_family"),
-                        "bounding_box": [fx0, fy0, fx1 - fx0, fy1 - fy0],
-                    }
-                )
-            if openai_words and not used_bb and not text_regions:
-                logger.info("[OpenAI Vision] No bounding_box in response; using fallback boxes for UI display.")
-                text_regions.extend(
-                    _words_to_text_regions_fallback(
-                        openai_words,
-                        px_min=int(px_min),
-                        py_min=int(py_min),
-                        crop_w=int(px_max - px_min),
-                        crop_h=int(py_max - py_min),
-                    )
-                )
-        else:
-            roi_dominant_text_color = None
         
         # Save debug images before inpainting
         debug_img_path, debug_mask_path = save_debug_images(
@@ -748,6 +650,7 @@ async def process_with_roi(
         "inpainting_method": inpainting_method,
         "image_width": w_orig,
         "image_height": h_orig,
+        "polygons": polygons_payload,
         "text_regions": text_regions,
         "openai": {
             "enabled": bool(openai_meta.get("enabled", False)),
@@ -766,9 +669,17 @@ async def process_with_roi(
 
 @app.get("/health", summary="Health check")
 def health():
+    openai_ready = (
+        USE_OCR
+        and OpenAI is not None
+        and bool(os.getenv("OPENAI_API_KEY"))
+        and bool(OPENAI_STYLE_PROMPT)
+    )
     return JSONResponse({
         "status": "ok",
         "lama_available": _lama_inpaint_fn is not None and LAMA_MODEL_PATH.exists(),
         "ocr_enabled": USE_OCR,
-        "ocr_available": USE_OCR and _ocr_model is not None and OCRFLUX_MODEL_PATH.exists(),
+        "ocr_provider": "openai",
+        "ocr_available": openai_ready,
     })
+

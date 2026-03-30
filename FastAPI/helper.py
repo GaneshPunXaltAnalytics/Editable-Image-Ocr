@@ -207,8 +207,8 @@ def save_outputs_to_disk(
         out_dir = outputs_root / datetime.now().strftime("%Y%m%d")
         out_dir.mkdir(parents=True, exist_ok=True)
         uid = uuid4().hex[:8]
-        final_path = out_dir / f"final_{uid}.png"
-        mask_path = out_dir / f"mask_{uid}.png"
+        final_path = out_dir / f"final_img_from_lama_end_{uid}.png"
+        mask_path = out_dir / f"final_mask_from_lama_end{uid}.png"
         Image.fromarray(final_rgb).save(final_path, format="PNG")
         Image.fromarray(mask_rgb).save(mask_path, format="PNG")
         return final_path, mask_path

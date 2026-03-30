@@ -13,6 +13,8 @@ Key design decisions:
 
 from __future__ import annotations
 
+import base64
+import asyncio
 import io
 import json
 import logging
@@ -20,9 +22,8 @@ import os
 import sys
 import time
 from collections import Counter
-from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -32,6 +33,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from PIL import Image
 
+import httpx
+
 try:
     from openai import OpenAI
 except Exception:  # pragma: no cover
@@ -40,13 +43,12 @@ except Exception:  # pragma: no cover
 # Load environment variables from .env file
 load_dotenv()
 
+GPU_RATE = float(os.getenv("GPU_RATE", "0.00016"))
 from helper import (
     apply_mask_keep_inside,
-    bgr_to_hex,
     build_mask_from_polygons,
     calculate_expanded_crop_region,
     get_polygon_bbox,
-    inpaint,
     np_to_b64_png,
     parse_polygons,
     save_debug_images,
@@ -67,13 +69,6 @@ PROJECT_ROOT = Path(os.getenv("PROJECT_ROOT", str(Path(__file__).resolve().paren
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# Load configuration from environment variables with defaults
-LAMA_MODEL_PATH_STR = os.getenv("LAMA_MODEL_PATH", "pretrained_models/big-lama")
-LAMA_MODEL_PATH = (
-    Path(LAMA_MODEL_PATH_STR) if Path(LAMA_MODEL_PATH_STR).is_absolute()
-    else PROJECT_ROOT / LAMA_MODEL_PATH_STR
-)
-
 OUTPUTS_ROOT_STR = os.getenv("OUTPUTS_ROOT", "saved_outputs")
 OUTPUTS_ROOT = (
     Path(OUTPUTS_ROOT_STR) if Path(OUTPUTS_ROOT_STR).is_absolute()
@@ -86,7 +81,7 @@ CORS_ORIGINS = [origin.strip() for origin in CORS_ORIGINS_STR.split(",") if orig
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 API_TITLE = os.getenv("API_TITLE", "Image Inpainting API")
 DEVICE = os.getenv("DEVICE", "cpu")
-
+AUTHORIZATION_TOKEN = os.getenv("AUTHORIZATION_TOKEN", "").strip()
 # OCR/OpenAI configuration
 USE_OCR = os.getenv("USE_OCR", "true").lower() in ("true", "1", "yes")
 
@@ -232,72 +227,198 @@ def _openai_analyze_polygon_crop(image_bgr: np.ndarray) -> tuple[list[dict[str, 
         return [], meta
 
 
-def _words_to_text_regions_fallback(
-    words: list[dict[str, Any]],
-    px_min: int,
-    py_min: int,
-    crop_w: int,
-    crop_h: int,
-    angle_deg: float = 0.0,
-) -> list[dict[str, Any]]:
+async def _remote_lama_inpaint_bgr(
+    img_bgr: np.ndarray,
+    mask_uint8: np.ndarray,
+) -> tuple[np.ndarray, str]:
     """
-    If the model returns words without bounding boxes, synthesize simple word boxes
-    inside the ROI crop so the UI can still render colored text overlays.
+    Call the remote /lama-inpainting API with RunPod-style JSON payload.
+    Expects response body with base64 PNG in "final" and optional "inpainting_method".
     """
-    regions: list[dict[str, Any]] = []
-    if not words or crop_w <= 0 or crop_h <= 0:
-        return regions
-
-    pad_x = max(6.0, crop_w * 0.02)
-    pad_y = max(6.0, crop_h * 0.02)
-    x = pad_x
-    y = pad_y
-    line_h = max(14.0, min(48.0, crop_h / 6.0))
-    space_w = max(6.0, line_h * 0.35)
-
-    for w in words:
-        text = str(w.get("text") or "").strip()
-        if not text:
-            continue
-        # crude width estimate: proportional to chars and line height
-        est_w = max(18.0, min(float(crop_w) - 2 * pad_x, (len(text) * line_h * 0.6) + 8.0))
-        est_h = max(12.0, line_h * 0.9)
-
-        if x + est_w > (crop_w - pad_x) and x > pad_x:
-            x = pad_x
-            y += line_h
-
-        if y + est_h > (crop_h - pad_y):
-            # no more room; stop to avoid stacking outside crop
-            break
-
-        fx0 = float(px_min) + x
-        fy0 = float(py_min) + y
-        fx1 = fx0 + est_w
-        fy1 = fy0 + est_h
-
-        regions.append(
-            {
-                "text": text,
-                "score": float(w.get("confidence")) if w.get("confidence") is not None else 1.0,
-                "angle_deg": float(angle_deg),
-                "polygon": [
-                    {"x": fx0, "y": fy0},
-                    {"x": fx1, "y": fy0},
-                    {"x": fx1, "y": fy1},
-                    {"x": fx0, "y": fy1},
-                ],
-                "color": w.get("color"),
-                "font_weight": w.get("font_weight"),
-                "font_style": w.get("font_style"),
-                "font_family": w.get("font_family"),
-                "bounding_box": [fx0, fy0, fx1 - fx0, fy1 - fy0],
-            }
+    if not LAMA_INPAINT_ENDPOINT_URL:
+        raise RuntimeError(
+            "LAMA_INPAINT_ENDPOINT_URL is not set (base URL or full URL ending with /lama-inpainting)."
         )
 
-        x += est_w + space_w
+    ok, buf_img = cv2.imencode(".png", img_bgr)
+    if not ok:
+        raise RuntimeError("Failed to encode image as PNG for LaMa request")
+    ok, buf_mask = cv2.imencode(".png", mask_uint8)
+    if not ok:
+        raise RuntimeError("Failed to encode mask as PNG for LaMa request")
 
-    return regions
+    image_b64 = base64.b64encode(buf_img.tobytes()).decode("ascii")
+    mask_b64 = base64.b64encode(buf_mask.tobytes()).decode("ascii")
+
+    payload: dict[str, Any] = {
+        "input": {
+            "data": {
+                "use_lama": "1",
+                "image_base64": image_b64,
+                "mask_base64": mask_b64,
+            },
+            "authorization":AUTHORIZATION_TOKEN
+        }
+    }
+    headers = {"Content-Type": "application/json"}
+    token = (os.getenv("LAMA_INPAINT_API_KEY") or os.getenv("RUNPOD_API_KEY") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    t20 = time.time()
+    timeout = httpx.Timeout(LAMA_INPAINT_TIMEOUT_SEC, connect=30.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(LAMA_INPAINT_ENDPOINT_URL, json=payload, headers=headers)
+
+    if resp.status_code >= 400:
+        raise RuntimeError(f"LaMa service HTTP {resp.status_code}: {resp.text[:800]}")
+
+    try:
+        body = resp.json()
+    except Exception as exc:
+        raise RuntimeError(f"LaMa service returned invalid JSON: {exc}") from exc
+
+    # RunPod async-only flow: initial response must include a job id to poll.
+    final_b64 = None
+    RUNPOD_GPU_COST = None
+    inpainting_method = "lama"
+    job_id = body.get("id")
+    initial_status = body.get("status")
+    if not job_id:
+        raise RuntimeError("LaMa async response missing `id` job identifier")
+
+    logger.info("LaMa async job submitted. job_id=%s initial_status=%s", job_id, initial_status)
+    poll_start = time.time()
+    timeout_sec = float(os.getenv("LAMA_INPAINT_TIMEOUT_SEC", str(LAMA_INPAINT_TIMEOUT_SEC)))
+    poll_interval = float(os.getenv("LAMA_INPAINT_POLL_INTERVAL_SEC", "1.5"))
+
+    while True:
+        status, result = await poll_lama_job_status(job_id=job_id, start_time=poll_start)
+        if status == "completed":
+            print("=================== LaMa job completed. Fetching result: ", result)
+            if not result or not result.get("final"):
+                raise RuntimeError("LaMa polling completed but response missing `output.final`")
+            final_b64 = str(result["final"])
+            delay_time = int(result.get("delay"))
+            execution_time = int(result.get("execution"))
+            RUNPOD_GPU_COST = ((delay_time + execution_time)/1000)*GPU_RATE
+            inpainting_method = str(result.get("inpainting_method") or inpainting_method)
+            break
+        if status == "failed":
+            error_text = (result or {}).get("error", "Unknown RunPod failure")
+            raise RuntimeError(f"LaMa async job failed: {error_text}")
+
+        if time.time() - poll_start > timeout_sec:
+            raise RuntimeError(f"LaMa async polling timed out after {timeout_sec:.1f}s")
+        await asyncio.sleep(poll_interval)
+
+    if not isinstance(final_b64, str):
+        raise RuntimeError("LaMa service response `final` must be a base64 string")
+    t21 = time.time()
+    print(f"============ [Inpainting] Polling completed in {t21-t20:.2f} seconds. Decoding image...")
+    raw = base64.b64decode(final_b64)
+    arr = np.frombuffer(raw, dtype=np.uint8)
+    inpainted = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if inpainted is None:
+        raise RuntimeError("Failed to decode inpainted PNG from LaMa service")
+
+    exp_h, exp_w = img_bgr.shape[:2]
+    if inpainted.shape[0] != exp_h or inpainted.shape[1] != exp_w:
+        inpainted = cv2.resize(inpainted, (exp_w, exp_h), interpolation=cv2.INTER_LINEAR)
+
+    return inpainted, str(inpainting_method), RUNPOD_GPU_COST
+
+
+async def poll_lama_job_status(
+    job_id: str,
+    start_time: Optional[float] = None,
+) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """
+    Poll RunPod inpainting status and return (status, result_dict).
+    Returns:
+      - ("completed", {"final": str, "delay": float, "execution": float, ...})
+      - ("in_progress", None)
+      - ("failed", {"error": str, "delay": float, "execution": float})
+    """
+    if start_time is None:
+        start_time = time.time()
+
+    timeout_sec = float(os.getenv("LAMA_INPAINT_TIMEOUT_SEC", str(LAMA_INPAINT_TIMEOUT_SEC)))
+    if time.time() - start_time > timeout_sec:
+        logger.error("Inpainting timeout exceeded for job %s", job_id)
+        return ("failed", {"error": "Inpainting timeout exceeded"})
+
+    status_base = LAMA_INPAINT_ENDPOINT_STATUS_URL
+    if not status_base:
+        if LAMA_INPAINT_ENDPOINT_URL.endswith("/run"):
+            status_base = f"{LAMA_INPAINT_ENDPOINT_URL[:-4]}/status"
+        else:
+            status_base = f"{LAMA_INPAINT_ENDPOINT_URL}/status"
+    status_url = f"{status_base}/{job_id}"
+
+    headers = {"Content-Type": "application/json"}
+    token = (os.getenv("LAMA_INPAINT_API_KEY") or os.getenv("RUNPOD_API_KEY") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    timeout = httpx.Timeout(LAMA_INPAINT_TIMEOUT_SEC, connect=30.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(status_url, headers=headers)
+
+        if resp.status_code != 200:
+            raise LamaStatusError(f"Bad status check ({resp.status_code}): {resp.text[:800]}")
+
+        try:
+            status_data = resp.json()
+        except Exception as exc:
+            raise LamaStatusError(f"Invalid JSON response: {exc}") from exc
+
+        current_status = str(status_data.get("status") or "").upper()
+        logger.info("Inpainting job %s status: %s", job_id, current_status)
+        delay_time = status_data.get("delayTime", 0.0)
+        execution_time = status_data.get("executionTime", 0.0)
+
+        if current_status == STATUS_COMPLETED:
+            output = status_data.get("output")
+            final_b64 = output.get("final") if isinstance(output, dict) else None
+            if not final_b64:
+                return (
+                    "failed",
+                    {"error": "Inpainting response missing output.final", "delay": delay_time, "execution": execution_time},
+                )
+
+            return (
+                "completed",
+                {
+                    "final": final_b64,
+                    "mask": output.get("mask") if isinstance(output, dict) else None,
+                    "image_width": output.get("image_width") if isinstance(output, dict) else None,
+                    "image_height": output.get("image_height") if isinstance(output, dict) else None,
+                    "inpainting_method": output.get("inpainting_method") if isinstance(output, dict) else "lama",
+                    "text_regions": output.get("text_regions") if isinstance(output, dict) else None,
+                    "delay": delay_time,
+                    "execution": execution_time,
+                },
+            )
+
+        if current_status == STATUS_FAILED:
+            error_message = status_data.get("error") or status_data.get("message") or "Unknown failure"
+            logger.error("Inpainting job failed: %s", error_message)
+            return ("failed", {"error": str(error_message), "delay": delay_time, "execution": execution_time})
+
+        if current_status in (STATUS_IN_QUEUE, STATUS_IN_PROGRESS):
+            return ("in_progress", None)
+
+        return ("in_progress", None)
+
+    except httpx.RequestError as exc:
+        logger.exception("Network error during inpainting polling")
+        raise LamaStatusError(f"Network error during inpainting polling: {exc}") from exc
+    except Exception as exc:
+        if isinstance(exc, LamaStatusError):
+            raise
+        logger.exception("Unexpected error during inpainting polling")
+        return ("failed", {"error": str(exc)})
 
 
 def _polygon_orientation_deg(polygons: list[list[tuple[float, float]]]) -> float:
@@ -335,6 +456,20 @@ INPAINT_MAX_EXPANSION = int(os.getenv("INPAINT_MAX_EXPANSION", "500"))  # Maximu
 # Mask padding configuration
 MASK_PADDING = int(os.getenv("MASK_PADDING", "0"))  # Padding/dilation size in pixels (default: 0 = no padding)
 
+# Remote LaMa service (RunPod or any host exposing POST /lama-inpainting)
+LAMA_INPAINT_ENDPOINT_URL = os.getenv("LAMA_INPAINT_ENDPOINT_URL", "").strip().rstrip("/")
+LAMA_INPAINT_TIMEOUT_SEC = float(os.getenv("LAMA_INPAINT_TIMEOUT_SEC", "300"))
+LAMA_INPAINT_ENDPOINT_STATUS_URL = os.getenv("LAMA_INPAINT_ENDPOINT_STATUS_URL", "").strip().rstrip("/")
+
+STATUS_COMPLETED = "COMPLETED"
+STATUS_FAILED = "FAILED"
+STATUS_IN_QUEUE = "IN_QUEUE"
+STATUS_IN_PROGRESS = "IN_PROGRESS"
+
+
+class LamaStatusError(RuntimeError):
+    """Raised for retryable status polling transport/errors."""
+
 # ---------------------------------------------------------------------------
 # Logging — use structured logging; replace with your log aggregator adapter
 # ---------------------------------------------------------------------------
@@ -344,52 +479,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("text_removal_api")
 
-# ---------------------------------------------------------------------------
-# Module-level singletons — populated during lifespan startup
-# ---------------------------------------------------------------------------
-_lama_inpaint_fn: Any = None       # callable or None if LaMa unavailable
-
-
-def _load_lama_inpaint_fn():
-    """
-    Attempt to import bin.predict.inpaint once at startup.
-    Returns the callable or None — callers must handle None gracefully.
-    """
-    try:
-        from bin.predict import inpaint  # noqa: PLC0415
-        logger.info("LaMa inpaint function loaded successfully.")
-        return inpaint
-    except Exception:
-        logger.warning(
-            "Could not import bin.predict.inpaint — LaMa inpainting unavailable; "
-            "will fall back to OpenCV.",
-            exc_info=True,
-        )
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Lifespan: load all heavy resources once, before the first request
-# ---------------------------------------------------------------------------
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global _lama_inpaint_fn
-
-    logger.info("Starting up: loading models…")
-    _lama_inpaint_fn = _load_lama_inpaint_fn()
-
-    if not LAMA_MODEL_PATH.exists():
-        logger.warning("LaMa model directory not found at %s — LaMa inpainting disabled.", LAMA_MODEL_PATH)
-
-    logger.info("Startup complete.")
-    yield
-    logger.info("Shutting down.")
-
-
-# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
-app = FastAPI(title=API_TITLE, lifespan=lifespan)
+app = FastAPI(title=API_TITLE)
 
 app.add_middleware(
     CORSMiddleware,
@@ -519,46 +611,49 @@ async def process_with_roi(
             "height": int(py_max_all - py_min_all),
         }
 
-    for poly_idx, polygon in enumerate(polygons_list):
-        px_min, py_min, px_max, py_max = get_polygon_bbox([polygon], w_orig, h_orig)
-        if not (px_max > px_min and py_max > py_min):
-            continue
-        poly_mask_full = build_mask_from_polygons(h_orig, w_orig, [polygon], padding=0)
-        img_polygon = img_bgr[py_min:py_max, px_min:px_max].copy()
-        mask_polygon = poly_mask_full[py_min:py_max, px_min:px_max].copy()
-        img_polygon_masked = apply_mask_keep_inside(img_polygon, mask_polygon)
+    if USE_OCR:
+        for poly_idx, polygon in enumerate(polygons_list):
+            px_min, py_min, px_max, py_max = get_polygon_bbox([polygon], w_orig, h_orig)
+            if not (px_max > px_min and py_max > py_min):
+                continue
+            poly_mask_full = build_mask_from_polygons(h_orig, w_orig, [polygon], padding=0)
+            img_polygon = img_bgr[py_min:py_max, px_min:px_max].copy()
+            mask_polygon = poly_mask_full[py_min:py_max, px_min:px_max].copy()
+            img_polygon_masked = apply_mask_keep_inside(img_polygon, mask_polygon)
 
-        words, meta = _openai_analyze_polygon_crop(img_polygon_masked)
-        openai_words_all.extend(words)
-        openai_enabled_any = openai_enabled_any or bool(meta.get("enabled", False))
-        if meta.get("model"):
-            openai_model_used = str(meta.get("model"))
-        openai_total_cost += float(meta.get("cost_usd", 0.0) or 0.0)
-        if meta.get("error"):
-            openai_errors.append(str(meta.get("error")))
+            words, meta = _openai_analyze_polygon_crop(img_polygon_masked)
+            openai_words_all.extend(words)
+            openai_enabled_any = openai_enabled_any or bool(meta.get("enabled", False))
+            if meta.get("model"):
+                openai_model_used = str(meta.get("model"))
+            openai_total_cost += float(meta.get("cost_usd", 0.0) or 0.0)
+            if meta.get("error"):
+                openai_errors.append(str(meta.get("error")))
 
-        text_parts = [str(w.get("text") or "").strip() for w in words]
-        text_parts = [t for t in text_parts if t]
-        score_vals = [float(w.get("confidence")) for w in words if w.get("confidence") is not None]
-        poly_angle_deg = _polygon_orientation_deg([polygon])
-        polygon_payload = [{"x": float(x), "y": float(y)} for (x, y) in polygon]
+            text_parts = [str(w.get("text") or "").strip() for w in words]
+            text_parts = [t for t in text_parts if t]
+            score_vals = [float(w.get("confidence")) for w in words if w.get("confidence") is not None]
+            poly_angle_deg = _polygon_orientation_deg([polygon])
+            polygon_payload = [{"x": float(x), "y": float(y)} for (x, y) in polygon]
 
-        text_regions.append(
-            {
-                "text": " ".join(text_parts),
-                "score": float(sum(score_vals) / len(score_vals)) if score_vals else 1.0,
-                "polygon_index": int(poly_idx),
-                "angle_deg": float(poly_angle_deg),
-                "polygon": polygon_payload,
-                "color": _dominant_hex_color(words),
-                "bounding_box": [float(px_min), float(py_min), float(px_max - px_min), float(py_max - py_min)],
-            }
-        )
+            text_regions.append(
+                {
+                    "text": " ".join(text_parts),
+                    "score": float(sum(score_vals) / len(score_vals)) if score_vals else 1.0,
+                    "polygon_index": int(poly_idx),
+                    "angle_deg": float(poly_angle_deg),
+                    "polygon": polygon_payload,
+                    "color": _dominant_hex_color(words),
+                    "bounding_box": [float(px_min), float(py_min), float(px_max - px_min), float(py_max - py_min)],
+                }
+            )
+    else:
+        logger.info("USE_OCR is false; skipping OpenAI OCR extraction.")
 
     roi_dominant_text_color = _dominant_hex_color(openai_words_all)
     openai_meta: dict[str, Any] = {
-        "enabled": bool(openai_enabled_any),
-        "model": openai_model_used,
+        "enabled": bool(USE_OCR and openai_enabled_any),
+        "model": openai_model_used if USE_OCR else None,
         "cost_usd": float(openai_total_cost),
         "error": "; ".join(sorted(set(openai_errors))) if openai_errors else None,
     }
@@ -593,19 +688,16 @@ async def process_with_roi(
             img_crop,
             mask_crop,
             OUTPUTS_ROOT,
-            prefix="debug_input_crop",
+            prefix="debug_input_crop_gp",
         )
         if debug_img_path:
             logger.info("Saved debug crop image: %s, mask: %s", debug_img_path, debug_mask_path)
         
-        # Run inpainting on cropped region
-        inpainted_crop, inpainting_method = inpaint(
-            img_crop,
-            mask_crop,
-            lama_inpaint_fn=_lama_inpaint_fn,
-            lama_model_path=LAMA_MODEL_PATH,
-            device=DEVICE,
-        )
+        # Run inpainting on cropped region via remote LaMa service
+        try:
+            inpainted_crop, inpainting_method, RUNPOD_GPU_COST = await _remote_lama_inpaint_bgr(img_crop, mask_crop)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
         
         # Paste inpainted crop back into full image
         inpainted_bgr = img_bgr.copy()
@@ -626,23 +718,23 @@ async def process_with_roi(
         if debug_img_path:
             logger.info("Saved debug full image: %s, mask: %s", debug_img_path, debug_mask_path)
         
-        inpainted_bgr, inpainting_method = inpaint(
-            img_bgr,
-            mask_full,
-            lama_inpaint_fn=_lama_inpaint_fn,
-            lama_model_path=LAMA_MODEL_PATH,
-            device=DEVICE,
-        )
+        try:
+            t11 = time.time()
+            inpainted_bgr, inpainting_method, RUNPOD_GPU_COST = await _remote_lama_inpaint_bgr(img_bgr, mask_full)
+            t12 = time.time()
+            print(f"[Inpainting] Full image time: {t12-t11:.2f} seconds")
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
     
     inpainting_elapsed_time = time.time() - inpainting_start_time
     logger.info("Inpainting complete using method: %s in %.2f seconds", inpainting_method, inpainting_elapsed_time)
     print(f"[Inpainting] Method: {inpainting_method} | Time taken: {inpainting_elapsed_time:.2f} seconds")
     print("===== MASK PADDING applied: ", MASK_PADDING)
-
+    print("======= RUNPOD_GPU_COST : ", RUNPOD_GPU_COST)
     # Prepare response images
     final_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
     mask_rgb = cv2.cvtColor(mask_full, cv2.COLOR_GRAY2RGB)
-
+    overall_request_cost = openai_meta.get("cost_usd", 0.0) + RUNPOD_GPU_COST
     final_path, saved_mask_path = save_outputs_to_disk(final_rgb, mask_rgb, OUTPUTS_ROOT)
     return JSONResponse({
         "final": np_to_b64_png(final_rgb),
@@ -658,12 +750,11 @@ async def process_with_roi(
             "cost_usd": openai_meta.get("cost_usd", 0.0),
             "error": openai_meta.get("error"),
         },
+        "runpod_gpu_cost_in_doller": RUNPOD_GPU_COST,
+        "overall_request_cost_in_doller": overall_request_cost,
+        "overall_request_cost_in_rupees": overall_request_cost * 90,
         "roi_crop_bbox": roi_crop_bbox,
-        "roi_dominant_text_color": roi_dominant_text_color,
-        "paths": {
-            "final": str(final_path) if final_path else None,
-            "mask": str(saved_mask_path) if saved_mask_path else None,
-        },
+        "roi_dominant_text_color": roi_dominant_text_color
     })
 
 
@@ -677,7 +768,8 @@ def health():
     )
     return JSONResponse({
         "status": "ok",
-        "lama_available": _lama_inpaint_fn is not None and LAMA_MODEL_PATH.exists(),
+        "lama_remote_configured": bool(LAMA_INPAINT_ENDPOINT_URL),
+        "lama_available": bool(LAMA_INPAINT_ENDPOINT_URL),
         "ocr_enabled": USE_OCR,
         "ocr_provider": "openai",
         "ocr_available": openai_ready,

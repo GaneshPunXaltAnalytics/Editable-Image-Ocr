@@ -33,7 +33,7 @@ from config import (API_TITLE, CORS_ORIGINS, INPAINT_MAX_EXPANSION,
                     OPENAI_STYLE_PROMPT, OPENAI_VISION_MODEL, USE_OCR)
 from helper import (apply_mask_keep_inside, build_mask_from_polygons,
                     calculate_expanded_crop_region, get_polygon_bbox,
-                    np_to_b64_png, parse_polygons)
+                    np_to_b64_png, parse_polygons, async_retry)
 
 # ---------------------------------------------------------------------------
 # Logging — use structured logging; replace with your log aggregator adapter

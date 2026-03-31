@@ -5,6 +5,7 @@ Helper functions for image processing and utilities.
 from __future__ import annotations
 
 import asyncio
+import functools
 import base64
 import io
 import json
@@ -674,3 +675,48 @@ def _polygon_orientation_deg(polygons: list[list[tuple[float, float]]]) -> float
         return float(angle)
     except Exception:
         return 0.0
+
+
+def async_retry(max_attempts: int = 3, delay: float = 1.0, backoff: float = 1.0, exceptions: tuple = (Exception,)):
+    """
+    Async retry decorator for async functions
+    Args:
+        max_attempts: Maximum number of retry attempts
+        delay: Initial delay between retries in seconds
+        backoff: Multiplier for delay after each retry (exponential backoff)
+        exceptions: Tuple of exceptions to catch and retry on
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            attempts = 0
+            last_exception = None
+            current_delay = delay
+
+            while attempts < max_attempts:
+                try:
+                    return await func(*args, **kwargs)
+                except exceptions as e:
+                    attempts += 1
+                    last_exception = e
+                    if attempts < max_attempts:
+                        await asyncio.sleep(current_delay)
+                        current_delay *= backoff  # Exponential backoff
+                    else:
+                        # Log final failure
+                        import logging
+                        logger = logging.getLogger(func.__module__)
+                        logger.error(f"{func.__name__} failed after {max_attempts} attempts: {str(e)}")
+
+            raise last_exception
+        return wrapper
+    return decorator
+
+
+# Retry transient RunPod/LaMa polling transport issues.
+poll_lama_job_status = async_retry(
+    max_attempts=3,
+    delay=1.0,
+    backoff=1.0,
+    exceptions=(LamaStatusError,),
+)(poll_lama_job_status)

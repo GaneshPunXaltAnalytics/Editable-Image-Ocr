@@ -20,7 +20,7 @@ from typing import Any
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from PIL import Image
@@ -31,9 +31,11 @@ from config import (API_TITLE, CORS_ORIGINS, INPAINT_MAX_EXPANSION,
                     INPAINT_USE_EXPANDED_CROP, LAMA_INPAINT_ENDPOINT_URL,
                     LOG_LEVEL, MASK_PADDING, OPENAI_API_KEY, OPENAI_AVAILABLE,
                     OPENAI_STYLE_PROMPT, OPENAI_VISION_MODEL, USE_OCR)
+from connection import (create_job, get_job, init_jobs_table, mark_job_failed,
+                        mark_job_running, mark_job_succeeded)
 from helper import (apply_mask_keep_inside, build_mask_from_polygons,
                     calculate_expanded_crop_region, get_polygon_bbox,
-                    np_to_b64_png, parse_polygons, async_retry)
+                    np_to_b64_png, parse_polygons)
 
 # ---------------------------------------------------------------------------
 # Logging — use structured logging; replace with your log aggregator adapter
@@ -43,6 +45,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("text_removal_api")
+init_jobs_table()
 
 # App
 # ---------------------------------------------------------------------------
@@ -60,60 +63,26 @@ app.add_middleware(
 # Endpoints
 # ---------------------------------------------------------------------------
 
+from fastapi import Header
+from jwt_auth import get_current_user
 
-@app.post(
-    "/process_roi",
-    summary="Inpaint full image within ROI polygons",
-)
-async def process_with_roi(
-    file: UploadFile = File(...),
-    polygons: str = Form(...),
-):
-    """
-    Accepts:
-    - **file**: full original image (multipart/form-data)
-    - **polygons**: JSON array of polygons — each polygon is an array of
-      `{x: number, y: number}` objects in image pixel coordinates.
-
-    Returns JSON with:
-    - **final**: base64 PNG of the inpainted image
-    - **mask**: base64 PNG of the inpaint mask
-    - **inpainting_method**: `"lama"`, `"lama_custom"`, or `"opencv"`
-    - **image_width / image_height**: dimensions of the original image
-    - **text_regions**: array of extracted text regions, each containing:
-      - **text**: extracted text string
-      - **polygon**: original polygon coordinates as array of {"x": number, "y": number} objects
-      - **score**: OCR confidence score (0-1)
-      - **color**: detected text color as hex string (e.g., "#000000") or None
-      - **color_bgr**: detected text color as BGR tuple [b, g, r] or None
-      - **background_color**: detected background color as hex string (e.g., "#ffffff") or None
-      - **background_color_bgr**: detected background color as BGR tuple [b, g, r] or None
-    """
-    if file.content_type.split("/")[0] != "image":
-        raise HTTPException(status_code=400, detail="Uploaded file must be an image.")
-
-    # Parse and validate polygons before touching the image
-    try:
-        polygons_list = parse_polygons(polygons)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    # Echo-safe polygon payload for frontend overlay alignment.
-    polygons_payload = [
-        [{"x": float(x), "y": float(y)} for (x, y) in poly] for poly in polygons_list
+def _job_polygons_to_tuples(
+    polygons_payload: list[list[dict[str, float]]],
+) -> list[list[tuple[float, float]]]:
+    return [
+        [(float(point["x"]), float(point["y"])) for point in polygon]
+        for polygon in polygons_payload
     ]
 
-    # Decode image
-    data = await file.read()
-    try:
-        pil_img = Image.open(io.BytesIO(data)).convert("RGB")
-    except Exception as exc:
-        raise HTTPException(
-            status_code=400, detail=f"Failed to decode image: {exc}"
-        ) from exc
 
+async def _run_process_roi_pipeline(
+    image_bytes: bytes, polygons_payload: list[list[dict[str, float]]]
+) -> dict[str, Any]:
+    pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     img_rgb = np.array(pil_img)
     img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
     h_orig, w_orig = img_bgr.shape[:2]
+    polygons_list = _job_polygons_to_tuples(polygons_payload)
 
     # Build mask with optional padding (this will be used for inpainting)
     mask_full = build_mask_from_polygons(
@@ -283,28 +252,120 @@ async def process_with_roi(
     final_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
     mask_rgb = cv2.cvtColor(mask_full, cv2.COLOR_GRAY2RGB)
     overall_request_cost = openai_meta.get("cost_usd", 0.0) + RUNPOD_GPU_COST
-    return JSONResponse(
-        {
-            "final": np_to_b64_png(final_rgb),
-            "mask": np_to_b64_png(mask_rgb),
-            "inpainting_method": inpainting_method,
-            "image_width": w_orig,
-            "image_height": h_orig,
-            "polygons": polygons_payload,
-            "text_regions": text_regions,
-            "openai": {
-                "enabled": bool(openai_meta.get("enabled", False)),
-                "model": openai_meta.get("model"),
-                "cost_usd": openai_meta.get("cost_usd", 0.0),
-                "error": openai_meta.get("error"),
-            },
-            "runpod_gpu_cost_in_doller": RUNPOD_GPU_COST,
-            "overall_request_cost_in_doller": overall_request_cost,
-            "overall_request_cost_in_rupees": overall_request_cost * 90,
-            "roi_crop_bbox": roi_crop_bbox,
-            "roi_dominant_text_color": roi_dominant_text_color,
-        }
+    return {
+        "final": np_to_b64_png(final_rgb),
+        "mask": np_to_b64_png(mask_rgb),
+        "inpainting_method": inpainting_method,
+        "image_width": w_orig,
+        "image_height": h_orig,
+        "polygons": polygons_payload,
+        "text_regions": text_regions,
+        "openai": {
+            "enabled": bool(openai_meta.get("enabled", False)),
+            "model": openai_meta.get("model"),
+            "cost_usd": openai_meta.get("cost_usd", 0.0),
+            "error": openai_meta.get("error"),
+        },
+        "runpod_gpu_cost_in_doller": RUNPOD_GPU_COST,
+        "overall_request_cost_in_doller": overall_request_cost,
+        "overall_request_cost_in_rupees": overall_request_cost * 90,
+        "roi_crop_bbox": roi_crop_bbox,
+        "roi_dominant_text_color": roi_dominant_text_color,
+    }
+
+
+async def _process_roi_job(job_id: str) -> None:
+    try:
+        job_record = get_job(job_id)
+        if not job_record:
+            logger.error("Job %s not found in database.", job_id)
+            return
+        mark_job_running(job_id)
+        input_image = job_record["input_image"]
+        if isinstance(input_image, memoryview):
+            image_bytes = input_image.tobytes()
+        elif isinstance(input_image, bytes):
+            image_bytes = input_image
+        else:
+            image_bytes = bytes(input_image)
+        polygons_payload = job_record["polygons"]
+        result_payload = await _run_process_roi_pipeline(image_bytes, polygons_payload)
+        mark_job_succeeded(job_id, result_payload)
+        logger.info("Job %s finished successfully.", job_id)
+    except Exception as exc:
+        logger.exception("Job %s failed: %s", job_id, exc)
+        mark_job_failed(job_id, str(exc))
+
+
+@app.post("/process_roi", summary="Create ROI inpainting job")
+async def process_with_roi(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    polygons: str = Form(...),
+    authorization: str = Header(None),
+):
+    current_user = await get_current_user(authorization)
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Invalid or missing JWT token")
+
+    if not file.content_type or file.content_type.split("/")[0] != "image":
+        raise HTTPException(status_code=400, detail="Uploaded file must be an image.")
+
+    try:
+        polygons_list = parse_polygons(polygons)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    polygons_payload = [
+        [{"x": float(x), "y": float(y)} for (x, y) in poly] for poly in polygons_list
+    ]
+    image_bytes = await file.read()
+    try:
+        Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Failed to decode image: {exc}"
+        ) from exc
+
+    user_id = str(current_user.get("sub") or current_user.get("id") or "anonymous")
+    job_id = create_job(
+        user_id=user_id,
+        image_bytes=image_bytes,
+        polygons_payload=polygons_payload,
     )
+    background_tasks.add_task(_process_roi_job, job_id)
+    return JSONResponse(
+        status_code=202,
+        content={"job_id": job_id, "status": "pending"},
+    )
+
+
+@app.get("/process_roi/status/{job_id}", summary="Get ROI inpainting job status")
+async def get_process_roi_job(job_id: str, authorization: str = Header(None)):
+    current_user = await get_current_user(authorization)
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Invalid or missing JWT token")
+
+    job_record = get_job(job_id)
+    if not job_record:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    user_id = str(current_user.get("sub") or current_user.get("id") or "anonymous")
+    print("================ Current user: ",current_user)
+    if job_record["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Access denied for this job")
+
+    response_payload: dict[str, Any] = {
+        "job_id": job_record["job_id"],
+        "status": job_record["status"]
+    }
+
+    if job_record["status"] == "failed":
+        response_payload["error"] = job_record.get("error_message")
+    if job_record["status"] == "succeeded":
+        response_payload["result"] = job_record.get("result")
+
+    return JSONResponse(response_payload)
 
 
 @app.get("/health", summary="Health check")

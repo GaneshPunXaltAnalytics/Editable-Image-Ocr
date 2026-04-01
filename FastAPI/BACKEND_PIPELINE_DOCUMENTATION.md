@@ -13,8 +13,9 @@ The backend is a **REST API** that:
 1. Accepts an **image** and one or more **polygon regions** (pixel coordinates).
 2. Builds a **binary mask** from those polygons (with optional dilation).
 3. Optionally calls **OpenAI Vision** per polygon to read text and style metadata.
-4. Sends the image and mask to a **remote LaMa inpainting service** (e.g., hosted on RunPod) and waits for the async job to finish.
-5. Returns the **inpainted result**, **mask**, metadata, and **cost hints** as JSON (images as Base64 PNG).
+4. Creates a **background job** in PostgreSQL and immediately returns a `job_id`.
+5. Processes the job asynchronously (OpenAI + remote LaMa) and stores the final result in DB.
+6. Lets the client poll a status endpoint with `job_id` until completion.
 
 ### What problem does it solve?
 
@@ -72,32 +73,36 @@ The backend is a **REST API** that:
         |
         |  multipart: image + polygons (JSON string)
         v
-[FastAPI App - main.py]
+[POST /process_roi]
         |
-        +--> Parse & validate polygons (helper)
-        +--> Decode image (PIL/OpenCV)
-        +--> Build mask, optional OpenAI per polygon (helper)
+        +--> JWT validation
+        +--> Parse polygons + validate image
+        +--> Insert job row in PostgreSQL (status=pending)
+        +--> schedule FastAPI BackgroundTask(job_id)
+        v
+[202 Accepted: { job_id, status }]
+
+[Background task worker]
+        |
+        +--> Mark running in PostgreSQL
+        +--> Build mask, optional OpenAI per polygon
         +--> Expanded crop OR full image
+        +--> Remote LaMa submit + poll
+        +--> Save result/error in PostgreSQL
         v
-[httpx AsyncClient]
+[status=succeeded|failed]
+
+[Client polls GET /process_roi/{job_id}]
         |
-        |  POST JSON: image_base64, mask_base64 + auth payload
-        v
-[Remote LaMa / RunPod Worker]
-        |
-        |  async: job id -> poll /status until COMPLETED
-        v
-[FastAPI] <-- decode inpainted PNG, paste crop if needed
-        |
-        v
-[JSONResponse: Base64 PNGs + metadata]
+        +--> pending/running/succeeded/failed (+ result/error)
 ```
 
 ### Components
 
 | Component | Role |
 |-----------|------|
-| **`main.py`** | HTTP layer: routing, validation orchestration, response assembly. |
+| **`main.py`** | HTTP layer: auth, job creation, background orchestration, status polling response assembly. |
+| **`connection.py`** | PostgreSQL connection and CRUD helpers for job lifecycle. |
 | **`helper.py`** | Masking, geometry, Base64 encoding, OpenAI vision calls, LaMa HTTP + polling, retries. |
 | **`config.py`** | Environment-driven settings (`python-dotenv`). |
 | **`prompts.py`** (project root) | Vision model system/content instructions for word-level JSON. |
@@ -106,10 +111,10 @@ The backend is a **REST API** that:
 ### Data flow (summary)
 
 1. **Bytes in**: uploaded file + form field `polygons`.
-2. **Arrays in memory**: RGB/BGR `numpy` images, uint8 masks.
-3. **Out to LaMa**: PNG bytes → Base64 JSON.
-4. **Back from LaMa**: Base64 PNG string → decoded BGR array → optional resize to match request crop.
-5. **Bytes out**: Base64 PNG strings inside JSON (no file writes required by this API).
+2. **Persist**: image bytes + polygons stored in PostgreSQL with `pending` status.
+3. **Background processing**: RGB/BGR arrays, uint8 masks, OpenAI and LaMa calls.
+4. **Persist result**: final JSON payload stored in PostgreSQL (`result` column).
+5. **Bytes out**: polling endpoint returns status and, on success, stored result JSON.
 
 ### Technologies and frameworks
 
@@ -154,25 +159,30 @@ The backend is a **REST API** that:
 
 ## 5. Pipeline Workflow (Step-by-Step)
 
-### Step 1 — Request arrives
+### Step 1 — Job submission request arrives
 
 - **POST `/process_roi`** with `multipart/form-data`:
   - `file`: image
   - `polygons`: string containing JSON array of polygons
+  - `Authorization: Bearer <JWT>`
 
-### Step 2 — Image gate
+### Step 2 — Validate request
 
+- JWT token is validated.
 - Reject if `Content-Type` is not under `image/*` → **400**.
+- `parse_polygons` checks schema and geometry rules; invalid payload → **422**.
+- Image decode check using PIL; decode failure → **400**.
 
-### Step 3 — Parse polygons
+### Step 3 — Create DB job + return immediately
 
-- `parse_polygons` runs `json.loads`, checks non-empty list, each polygon ≥ 3 points, each point has numeric `x` and `y`.
-- On failure → **422** with detail message.
+- Store `job_id`, `user_id`, `status=pending`, `polygons`, `input_image`, timestamps in PostgreSQL.
+- Schedule `BackgroundTasks` worker.
+- Return **202** with `job_id`.
 
-### Step 4 — Decode image
+### Step 4 — Background task starts
 
-- Read bytes, open with PIL, convert to RGB, then to BGR via OpenCV for processing.
-- Decode failure → **400**.
+- Load job record by `job_id`, set status to `running`.
+- Read `input_image` from DB and run the same image pipeline as before.
 
 ### Step 5 — Build mask
 
@@ -205,10 +215,15 @@ If **`USE_OCR`** is false: skip; `text_regions` stays empty.
   - `poll_lama_job_status` GETs status until **COMPLETED** or **FAILED** or timeout.
 - Decode returned PNG; if dimensions differ from input patch, **resize** to match.
 
-### Step 9 — Response
+### Step 9 — Persist final job result
 
-- Convert inpainted BGR → RGB; mask → RGB visualization.
-- Build JSON: Base64 PNGs, method string, dimensions, polygons echo, `text_regions`, OpenAI meta, GPU cost estimate, overall cost (USD + rough INR multiplier), ROI bbox and dominant color.
+- On success: store `status=succeeded`, `result` JSON, `completed_at`.
+- On failure: store `status=failed`, `error_message`, `completed_at`.
+
+### Step 10 — Client polls job status
+
+- Client calls `GET /process_roi/{job_id}` with JWT.
+- Response includes status and timestamps; includes `result` only when succeeded, or `error` when failed.
 
 ---
 
@@ -225,7 +240,10 @@ If **`USE_OCR`** is false: skip; `text_regions` stays empty.
 
 | Name | Purpose |
 |------|---------|
-| `process_with_roi` | FastAPI handler: validate input, orchestrate mask, OCR, inpainting, JSON response. |
+| `process_with_roi` | Job creation handler: validate input, persist job, enqueue background work, return `job_id`. |
+| `get_process_roi_job` | Polling handler: return job status/timestamps/result or error for a `job_id`. |
+| `_process_roi_job` | Background worker entrypoint for a single `job_id`. |
+| `_run_process_roi_pipeline` | Shared heavy processing pipeline used by the background task. |
 | `health` | Readiness-style summary for LaMa URL and OpenAI OCR availability. |
 
 ### `helper.py`
@@ -268,7 +286,7 @@ Base URL depends on deployment (local default commonly `http://127.0.0.1:8000`).
 
 ### POST `/process_roi`
 
-**Summary:** Inpaint the uploaded image in regions defined by polygons; optionally extract text/style per polygon.
+**Summary:** Create an async ROI inpainting job and return `job_id` immediately.
 
 **Content type:** `multipart/form-data`
 
@@ -292,74 +310,127 @@ Base URL depends on deployment (local default commonly `http://127.0.0.1:8000`).
 ]
 ```
 
-**Success response:** `200` — `application/json`
+**Success response:** `202` — `application/json`
 
 **Response body shape (representative)**
 
 ```json
 {
-  "final": "iVBORw0KGgoAAAANSUhEUgAA...(truncated)",
-  "mask": "iVBORw0KGgoAAAANSUhEUgAA...(truncated)",
-  "inpainting_method": "lama",
-  "image_width": 1920,
-  "image_height": 1080,
-  "polygons": [
-    [{"x": 100.0, "y": 100.0}, {"x": 200.0, "y": 100.0}, {"x": 200.0, "y": 150.0}, {"x": 100.0, "y": 150.0}]
-  ],
-  "text_regions": [
-    {
-      "text": "Hello",
-      "score": 0.95,
-      "polygon_index": 0,
-      "angle_deg": 0.0,
-      "polygon": [{"x": 100.0, "y": 100.0}, "..."],
-      "color": "#1A1A1A",
-      "bounding_box": [100.0, 100.0, 100.0, 50.0]
-    }
-  ],
-  "openai": {
-    "enabled": true,
-    "model": "gpt-4o-mini",
-    "cost_usd": 0.0012,
-    "error": null
-  },
-  "runpod_gpu_cost_in_doller": 0.0005,
-  "overall_request_cost_in_doller": 0.0017,
-  "overall_request_cost_in_rupees": 0.153,
-  "roi_crop_bbox": {"x": 90, "y": 90, "width": 120, "height": 70},
-  "roi_dominant_text_color": "#1A1A1A"
+  "job_id": "f0f25c12-a507-4adc-9576-251130e7a6b4",
+  "status": "pending"
 }
 ```
 
 Field notes:
 
-- **`final` / `mask`**: Base64-encoded PNG (not a data URL). Decode with standard Base64 → bytes → image library.
-- **`text_regions`**: Empty list when `USE_OCR` is false or analysis fails silently per polygon.
-- **Costs**: `overall_request_cost_in_rupees` uses a **fixed multiplier (×90)** in code for rough INR — adjust for real FX in production reporting if needed.
-- Typo in API: **`runpod_gpu_cost_in_doller`** / **`overall_request_cost_in_doller`** use “doller” spelling as in the implementation.
+- `job_id` is the identifier the UI must use to poll job progress/result.
+- Initial status currently returns `pending`.
 
 **Status codes**
 
 | Code | When |
 |------|------|
-| 200 | Success. |
+| 202 | Job accepted and queued. |
+| 401 | Invalid or missing JWT token. |
 | 400 | Not an image, or image decode failed. |
 | 422 | Invalid `polygons` JSON or geometry rules violated. |
-| 502 | LaMa remote error wrapped as `RuntimeError` (bad HTTP, timeout, job failed, missing fields). |
+
+**Example success JSON**
+
+```json
+{
+  "job_id": "f0f25c12-a507-4adc-9576-251130e7a6b4",
+  "status": "pending"
+}
+```
 
 **Example error JSON (FastAPI)**
 
 ```json
 {
-  "detail": "polygons must be a non-empty JSON array."
+  "detail": "Invalid or missing JWT token"
 }
 ```
 
+---
+
+### GET `/process_roi/{job_id}`
+
+**Summary:** Poll async job status and fetch final result when complete.
+
+**Headers**
+
+| Header | Required | Description |
+|--------|----------|-------------|
+| `Authorization` | Yes | `Bearer <JWT>` |
+
+**Success response:** `200`
+
 ```json
 {
-  "detail": "Uploaded file must be an image."
+  "job_id": "f0f25c12-a507-4adc-9576-251130e7a6b4",
+  "status": "running",
+  "created_at": "2026-04-01T12:31:10.120000+00:00",
+  "updated_at": "2026-04-01T12:31:12.440000+00:00",
+  "completed_at": null
 }
 ```
+
+If succeeded, `result` is included:
+
+```json
+{
+  "job_id": "f0f25c12-a507-4adc-9576-251130e7a6b4",
+  "status": "succeeded",
+  "created_at": "2026-04-01T12:31:10.120000+00:00",
+  "updated_at": "2026-04-01T12:31:18.900000+00:00",
+  "completed_at": "2026-04-01T12:31:18.900000+00:00",
+  "result": {
+    "final": "iVBORw0KGgoAAAANSUhEUgAA...(truncated)",
+    "mask": "iVBORw0KGgoAAAANSUhEUgAA...(truncated)",
+    "inpainting_method": "lama",
+    "image_width": 1920,
+    "image_height": 1080,
+    "polygons": [
+      [{"x": 100.0, "y": 100.0}, {"x": 200.0, "y": 100.0}, {"x": 200.0, "y": 150.0}, {"x": 100.0, "y": 150.0}]
+    ],
+    "text_regions": [],
+    "openai": {
+      "enabled": true,
+      "model": "gpt-4o-mini",
+      "cost_usd": 0.0012,
+      "error": null
+    },
+    "runpod_gpu_cost_in_doller": 0.0005,
+    "overall_request_cost_in_doller": 0.0017,
+    "overall_request_cost_in_rupees": 0.153,
+    "roi_crop_bbox": {"x": 90, "y": 90, "width": 120, "height": 70},
+    "roi_dominant_text_color": "#1A1A1A"
+  }
+}
+```
+
+If failed, `error` is included:
+
+```json
+{
+  "job_id": "f0f25c12-a507-4adc-9576-251130e7a6b4",
+  "status": "failed",
+  "created_at": "2026-04-01T12:31:10.120000+00:00",
+  "updated_at": "2026-04-01T12:31:16.020000+00:00",
+  "completed_at": "2026-04-01T12:31:16.020000+00:00",
+  "error": "Remote inpainting failed: timeout"
+}
+```
+
+**Status codes**
+
+| Code | When |
+|------|------|
+| 200 | Job found and visible to caller. |
+| 401 | Invalid or missing JWT token. |
+| 403 | Job belongs to a different user. |
+| 404 | `job_id` not found. |
 
 ---
 
@@ -403,12 +474,17 @@ Field notes:
 
 ### Storage
 
-- **In-memory only** in this service: no required persistence of uploads or results.
-- **Optional** local paths (`LAMA_MODEL_PATH`, `OUTPUTS_ROOT`) appear in older `env.example` / `ENV_SETUP.md` but **this FastAPI path does not write outputs to disk** in `main.py`.
+- Input image bytes, polygon payload, job status, and final JSON result are persisted in PostgreSQL.
+- No required file-system output writes in the `/process_roi` flow.
 
 ### Database
 
-- **None.** No schema; all state is per request.
+- PostgreSQL table: **`image-editable`**
+- Columns used by this API:
+  - `user_id`, `job_id`, `status`, `polygons`, `input_image`
+  - `created_at`, `updated_at`, `completed_at`
+  - `error_message`, `result`
+- Job states used in code: `pending`, `running`, `succeeded`, `failed`
 
 ---
 
@@ -444,7 +520,9 @@ Field notes:
 
 ### Authentication and authorization (this API)
 
-- **No end-user authentication** is implemented on `/process_roi` or `/health` in the provided code — anyone who can reach the server can invoke inpainting (**protect with network policies, API gateway, or add auth middleware** in production).
+- `/process_roi` and `/process_roi/{job_id}` require JWT via `Authorization: Bearer <token>`.
+- `job_id` access is user-scoped: a user can only read their own jobs (`user_id` match).
+- `/health` remains open unless protected upstream.
 
 ### Secrets usage
 
@@ -574,9 +652,9 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 ### Known limitations
 
-- **No durable storage** or job history in this service.
+- Uses FastAPI `BackgroundTasks` (in-process): if API process restarts, in-flight jobs may fail.
 - **Sequential vision** calls for many polygons.
-- **502** merges many failure modes — clients may want finer-grained error types over time.
+- Failed jobs return string errors; finer-grained machine-readable failure codes may be needed over time.
 
 ---
 

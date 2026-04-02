@@ -13,6 +13,8 @@ Key design decisions:
 
 from __future__ import annotations
 
+import base64
+import binascii
 import io
 import logging
 import time
@@ -20,7 +22,8 @@ from typing import Any
 
 import cv2
 import numpy as np
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, HTTPException
+from pydantic import BaseModel, Field, field_validator
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from PIL import Image
@@ -35,7 +38,7 @@ from connection import (create_job, get_job, init_jobs_table, mark_job_failed,
                         mark_job_running, mark_job_succeeded)
 from helper import (apply_mask_keep_inside, build_mask_from_polygons,
                     calculate_expanded_crop_region, get_polygon_bbox,
-                    np_to_b64_png, parse_polygons)
+                    np_to_b64_png)
 
 # ---------------------------------------------------------------------------
 # Logging — use structured logging; replace with your log aggregator adapter
@@ -73,6 +76,50 @@ def _job_polygons_to_tuples(
         [(float(point["x"]), float(point["y"])) for point in polygon]
         for polygon in polygons_payload
     ]
+
+
+class _RoiPolygonPoint(BaseModel):
+    x: float
+    y: float
+
+
+class ProcessRoiRequest(BaseModel):
+    """JSON body for POST /process_roi: base64 image + polygon list."""
+
+    image_base64: str = Field(
+        ...,
+        description="Image as standard base64, or a data URL (data:image/...;base64,...).",
+    )
+    polygons: list[list[_RoiPolygonPoint]]
+
+    @field_validator("polygons")
+    @classmethod
+    def _polygons_valid(cls, v: list[list[_RoiPolygonPoint]]) -> list[list[_RoiPolygonPoint]]:
+        if not v:
+            raise ValueError("polygons must be a non-empty array.")
+        for i, poly in enumerate(v):
+            if len(poly) < 3:
+                raise ValueError(f"Polygon {i} must have at least 3 points.")
+        return v
+
+
+def _decode_image_base64(raw: str) -> bytes:
+    s = raw.strip()
+    if s.startswith("data:"):
+        comma = s.find(",")
+        if comma != -1:
+            s = s[comma + 1 :]
+    try:
+        image_bytes = base64.b64decode(s, validate=True)
+    except binascii.Error as exc:
+        raise HTTPException(
+            status_code=400, detail="image_base64 is not valid base64."
+        ) from exc
+    if not image_bytes:
+        raise HTTPException(
+            status_code=400, detail="image_base64 decodes to empty data."
+        )
+    return image_bytes
 
 
 async def _run_process_roi_pipeline(
@@ -266,8 +313,8 @@ async def _run_process_roi_pipeline(
             "cost_usd": openai_meta.get("cost_usd", 0.0),
             "error": openai_meta.get("error"),
         },
-        "runpod_gpu_cost_in_doller": RUNPOD_GPU_COST,
-        "overall_request_cost_in_doller": overall_request_cost,
+        "runpod_gpu_cost_in_dollar": RUNPOD_GPU_COST,
+        "overall_request_cost_in_dollar": overall_request_cost,
         "overall_request_cost_in_rupees": overall_request_cost * 90,
         "roi_crop_bbox": roi_crop_bbox,
         "roi_dominant_text_color": roi_dominant_text_color,
@@ -300,32 +347,24 @@ async def _process_roi_job(job_id: str) -> None:
 @app.post("/process_roi", summary="Create ROI inpainting job")
 async def process_with_roi(
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    polygons: str = Form(...),
+    body: ProcessRoiRequest,
     authorization: str = Header(None),
 ):
     current_user = await get_current_user(authorization)
     if not current_user:
         raise HTTPException(status_code=401, detail="Invalid or missing JWT token")
 
-    if not file.content_type or file.content_type.split("/")[0] != "image":
-        raise HTTPException(status_code=400, detail="Uploaded file must be an image.")
-
-    try:
-        polygons_list = parse_polygons(polygons)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    polygons_payload = [
-        [{"x": float(x), "y": float(y)} for (x, y) in poly] for poly in polygons_list
-    ]
-    image_bytes = await file.read()
+    image_bytes = _decode_image_base64(body.image_base64)
     try:
         Image.open(io.BytesIO(image_bytes)).convert("RGB")
     except Exception as exc:
         raise HTTPException(
             status_code=400, detail=f"Failed to decode image: {exc}"
         ) from exc
+
+    polygons_payload = [
+        [{"x": float(p.x), "y": float(p.y)} for p in poly] for poly in body.polygons
+    ]
 
     user_id = str(current_user.get("sub") or current_user.get("id") or "anonymous")
     job_id = create_job(

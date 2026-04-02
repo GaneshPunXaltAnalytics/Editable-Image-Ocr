@@ -71,12 +71,12 @@ The backend is a **REST API** that:
 ```text
 [Client / Frontend]
         |
-        |  multipart: image + polygons (JSON string)
+        |  JSON: image_base64 + polygons[]
         v
 [POST /process_roi]
         |
         +--> JWT validation
-        +--> Parse polygons + validate image
+        +--> Decode base64, validate polygons (Pydantic), validate image (PIL)
         +--> Insert job row in PostgreSQL (status=pending)
         +--> schedule FastAPI BackgroundTask(job_id)
         v
@@ -92,7 +92,7 @@ The backend is a **REST API** that:
         v
 [status=succeeded|failed]
 
-[Client polls GET /process_roi/{job_id}]
+[Client polls GET /process_roi/status/{job_id}]
         |
         +--> pending/running/succeeded/failed (+ result/error)
 ```
@@ -110,7 +110,7 @@ The backend is a **REST API** that:
 
 ### Data flow (summary)
 
-1. **Bytes in**: uploaded file + form field `polygons`.
+1. **Bytes in**: JSON body with Base64-encoded image (`image_base64`) and structured `polygons` array; server decodes to raw image bytes before persisting the job.
 2. **Persist**: image bytes + polygons stored in PostgreSQL with `pending` status.
 3. **Background processing**: RGB/BGR arrays, uint8 masks, OpenAI and LaMa calls.
 4. **Persist result**: final JSON payload stored in PostgreSQL (`result` column).
@@ -147,7 +147,7 @@ The backend is a **REST API** that:
 | Remote LaMa | Avoid loading large models in the API process; scale GPU independently. |
 | Expanded crop default | Large masks on huge images can be slow or numerically awkward; cropping caps **mask area ratio** inside the patch sent to LaMa. |
 | OpenAI **per polygon** | Matches UI geometry exactly; each region gets its own analysis. |
-| Base64 in JSON | Simple for browser clients; tradeoff is larger payloads vs. binary multipart responses. |
+| Base64 image in JSON (`POST /process_roi`) | Single `application/json` request from browsers and mobile clients; larger payloads than raw binary multipart but simpler client integration. |
 
 ### Scalability and performance
 
@@ -161,16 +161,16 @@ The backend is a **REST API** that:
 
 ### Step 1 — Job submission request arrives
 
-- **POST `/process_roi`** with `multipart/form-data`:
-  - `file`: image
-  - `polygons`: string containing JSON array of polygons
+- **POST `/process_roi`** with `application/json`:
+  - `image_base64`: Base64-encoded image bytes, or a data URL (`data:image/png;base64,...`)
+  - `polygons`: JSON array of polygons (each polygon: array of `{ "x", "y" }` points)
   - `Authorization: Bearer <JWT>`
 
 ### Step 2 — Validate request
 
 - JWT token is validated.
-- Reject if `Content-Type` is not under `image/*` → **400**.
-- `parse_polygons` checks schema and geometry rules; invalid payload → **422**.
+- Request body is parsed as **`ProcessRoiRequest`** (Pydantic): invalid JSON or polygon rules → **422**.
+- `image_base64` is decoded (invalid Base64 or empty payload → **400**).
 - Image decode check using PIL; decode failure → **400**.
 
 ### Step 3 — Create DB job + return immediately
@@ -222,7 +222,7 @@ If **`USE_OCR`** is false: skip; `text_regions` stays empty.
 
 ### Step 10 — Client polls job status
 
-- Client calls `GET /process_roi/{job_id}` with JWT.
+- Client calls `GET /process_roi/status/{job_id}` with JWT.
 - Response includes status and timestamps; includes `result` only when succeeded, or `error` when failed.
 
 ---
@@ -240,7 +240,9 @@ If **`USE_OCR`** is false: skip; `text_regions` stays empty.
 
 | Name | Purpose |
 |------|---------|
-| `process_with_roi` | Job creation handler: validate input, persist job, enqueue background work, return `job_id`. |
+| `ProcessRoiRequest` | Pydantic model for **`POST /process_roi`**: `image_base64`, `polygons` (nested point lists), with polygon count/point-count validation. |
+| `_decode_image_base64` | Normalizes optional `data:...;base64,` prefix and decodes strict Base64; **400** on invalid or empty payload. |
+| `process_with_roi` | Job creation handler: validate JSON body (Base64 image + polygons), persist job, enqueue background work, return `job_id`. |
 | `get_process_roi_job` | Polling handler: return job status/timestamps/result or error for a `job_id`. |
 | `_process_roi_job` | Background worker entrypoint for a single `job_id`. |
 | `_run_process_roi_pipeline` | Shared heavy processing pipeline used by the background task. |
@@ -253,7 +255,7 @@ If **`USE_OCR`** is false: skip; `text_regions` stays empty.
 | `image_to_b64_png` | PIL image → Base64 PNG string. |
 | `np_to_b64_png` | H×W×3 uint8 RGB array → Base64 PNG string. |
 | `apply_mask_keep_inside` | Zeroes pixels outside mask (shows only masked region content in a crop). |
-| `parse_polygons` | Validates and parses polygon JSON to lists of `(x,y)` tuples. |
+| `parse_polygons` | Utility: validates and parses polygon data from a **JSON string** to lists of `(x,y)` tuples (same geometry rules as the API body). `/process_roi` uses Pydantic models on the JSON body instead. |
 | `get_polygon_bbox` | Axis-aligned bounding box of all polygons, clamped to image. |
 | `build_mask_from_polygons` | Rasterizes polygons to uint8 mask; optional dilation. |
 | `calculate_expanded_crop_region` | Computes crop rectangle to control mask-to-window ratio. |
@@ -288,26 +290,36 @@ Base URL depends on deployment (local default commonly `http://127.0.0.1:8000`).
 
 **Summary:** Create an async ROI inpainting job and return `job_id` immediately.
 
-**Content type:** `multipart/form-data`
+**Content type:** `application/json`
 
-**Form fields**
+**Headers**
+
+| Header | Required | Description |
+|--------|----------|-------------|
+| `Authorization` | Yes | `Bearer <JWT>` |
+| `Content-Type` | Yes | `application/json` |
+
+**JSON body fields**
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `file` | file | Yes | Image file (browser typically sends `Content-Type: image/png`, etc.). |
-| `polygons` | string | Yes | JSON string: array of polygons; each polygon is array of `{ "x": number, "y": number }`. |
+| `image_base64` | string | Yes | Standard Base64 image bytes, or a data URL prefix `data:image/<subtype>;base64,` before the payload. |
+| `polygons` | array | Yes | Non-empty array of polygons. Each polygon is an array of at least **3** points `{ "x": number, "y": number }` in **pixel coordinates** matching the decoded image size. |
 
-**Example `polygons` value (as a single string in the form)**
+**Example request body**
 
 ```json
-[
-  [
-    {"x": 100, "y": 100},
-    {"x": 200, "y": 100},
-    {"x": 200, "y": 150},
-    {"x": 100, "y": 150}
+{
+  "image_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+  "polygons": [
+    [
+      {"x": 100, "y": 100},
+      {"x": 200, "y": 100},
+      {"x": 200, "y": 150},
+      {"x": 100, "y": 150}
+    ]
   ]
-]
+}
 ```
 
 **Success response:** `202` — `application/json`
@@ -332,8 +344,8 @@ Field notes:
 |------|------|
 | 202 | Job accepted and queued. |
 | 401 | Invalid or missing JWT token. |
-| 400 | Not an image, or image decode failed. |
-| 422 | Invalid `polygons` JSON or geometry rules violated. |
+| 400 | Invalid or empty Base64, or image decode failed after Base64 decode. |
+| 422 | Invalid JSON body, invalid `polygons` structure, or geometry rules violated (e.g. fewer than 3 points per polygon). |
 
 **Example success JSON**
 
@@ -354,7 +366,7 @@ Field notes:
 
 ---
 
-### GET `/process_roi/{job_id}`
+### GET `/process_roi/status/{job_id}`
 
 **Summary:** Poll async job status and fetch final result when complete.
 
@@ -465,8 +477,8 @@ If failed, `error` is included:
 
 ### Input formats
 
-- **Image:** Any format **Pillow** can open from bytes (PNG, JPEG, WebP, etc.); internally normalized to RGB then BGR.
-- **Polygons:** JSON string, pixel coordinates in the **same resolution** as the uploaded image.
+- **Image:** Sent as **`image_base64`** in the JSON body. After Base64 decode, any format **Pillow** can open from bytes (PNG, JPEG, WebP, etc.); internally normalized to RGB then BGR.
+- **Polygons:** Native JSON array in the same request body, pixel coordinates in the **same resolution** as the decoded image.
 
 ### Output formats
 
@@ -492,8 +504,9 @@ If failed, `error` is included:
 
 ### Validation rules
 
-- Upload **must** be an image MIME top-level type `image`.
-- `polygons` must be valid JSON array, non-empty.
+- **`image_base64`**: must decode to non-empty bytes; must be valid Base64 (strict alphabet check on decode).
+- After decode, bytes **must** be a raster image openable by **Pillow** as RGB.
+- **`polygons`**: must be a non-empty JSON array (in the request object, not a nested string).
 - Each polygon: at least **3** points.
 - Each point: numeric **`x`** and **`y`** keys.
 
@@ -507,8 +520,9 @@ If failed, `error` is included:
 
 | Scenario | Typical outcome |
 |---------|-----------------|
-| Wrong MIME type | 400 |
-| Malformed polygon JSON | 422 |
+| Invalid or empty Base64 | 400 |
+| Decoded bytes not a valid image | 400 |
+| Malformed JSON or polygon structure | 422 |
 | Point missing `x`/`y` | 422 |
 | LaMa down / HTTP 5xx | 502 |
 | Job timeout | 502 with timeout message |
@@ -520,7 +534,7 @@ If failed, `error` is included:
 
 ### Authentication and authorization (this API)
 
-- `/process_roi` and `/process_roi/{job_id}` require JWT via `Authorization: Bearer <token>`.
+- `/process_roi` and `/process_roi/status/{job_id}` require JWT via `Authorization: Bearer <token>`.
 - `job_id` access is user-scoped: a user can only read their own jobs (`user_id` match).
 - `/health` remains open unless protected upstream.
 
@@ -539,7 +553,7 @@ If failed, `error` is included:
 ### API security practices (recommendations)
 
 - Rate limiting at reverse proxy / API gateway.
-- Request size limits for uploads.
+- Request body size limits (JSON + Base64 images can be large).
 - Rotate keys; never commit `.env`.
 
 ---
